@@ -5,8 +5,28 @@ namespace live::business::promotion {
 common::Status FlashSaleAdmissionGate::configure(const std::string& promotion_id, std::size_t quota) {
     if (promotion_id.empty() || quota == 0) return common::Status::InvalidArgument("invalid admission gate");
     std::lock_guard<std::mutex> lock(mutex_);
-    if (gates_.find(promotion_id) != gates_.end()) return common::Status::AlreadyExists("admission gate exists");
+    const auto existing = gates_.find(promotion_id);
+    if (existing != gates_.end()) {
+        if (existing->second.state != State::kCreated || existing->second.admitted != 0)
+            return common::Status::FailedPrecondition("only an unused created admission gate can be reconfigured");
+        existing->second.quota = quota;
+        return common::Status::Ok();
+    }
     gates_.emplace(promotion_id, Gate{quota, 0, State::kCreated, {}});
+    return common::Status::Ok();
+}
+
+common::Status FlashSaleAdmissionGate::synchronize(const std::string& promotion_id, AdmissionState state) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Gate* gate = nullptr;
+    if (const auto status = findGate(promotion_id, &gate); !status.ok()) return status;
+    switch (state) {
+        case AdmissionState::kCreated: gate->state = State::kCreated; break;
+        case AdmissionState::kPreheating: gate->state = State::kPreheating; break;
+        case AdmissionState::kRunning: gate->state = State::kRunning; break;
+        case AdmissionState::kPaused: gate->state = State::kPaused; break;
+        case AdmissionState::kFinished: gate->state = State::kFinished; break;
+    }
     return common::Status::Ok();
 }
 
@@ -42,11 +62,29 @@ common::Status FlashSaleAdmissionGate::start(const std::string& promotion_id) {
     return common::Status::Ok();
 }
 
+common::Status FlashSaleAdmissionGate::pause(const std::string& promotion_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Gate* gate = nullptr;
+    if (const auto status = findGate(promotion_id, &gate); !status.ok()) return status;
+    if (gate->state != State::kRunning) return common::Status::FailedPrecondition("only running promotions can be paused");
+    gate->state = State::kPaused;
+    return common::Status::Ok();
+}
+
+common::Status FlashSaleAdmissionGate::resume(const std::string& promotion_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Gate* gate = nullptr;
+    if (const auto status = findGate(promotion_id, &gate); !status.ok()) return status;
+    if (gate->state != State::kPaused) return common::Status::FailedPrecondition("only paused promotions can be resumed");
+    gate->state = State::kRunning;
+    return common::Status::Ok();
+}
+
 common::Status FlashSaleAdmissionGate::finish(const std::string& promotion_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     Gate* gate = nullptr;
     if (const auto status = findGate(promotion_id, &gate); !status.ok()) return status;
-    if (gate->state != State::kRunning) return common::Status::FailedPrecondition("invalid gate finish transition");
+    if (gate->state != State::kRunning && gate->state != State::kPaused) return common::Status::FailedPrecondition("invalid gate finish transition");
     gate->state = State::kFinished;
     return common::Status::Ok();
 }
@@ -65,6 +103,10 @@ common::Status FlashSaleAdmissionGate::tryAcquire(const std::string& promotion_i
     }
     if (gate->state == State::kFinished) {
         decision->code = AdmissionCode::kFinished;
+        return common::Status::Ok();
+    }
+    if (gate->state == State::kPaused) {
+        decision->code = AdmissionCode::kPaused;
         return common::Status::Ok();
     }
     if (gate->users.find(user_id) != gate->users.end()) {

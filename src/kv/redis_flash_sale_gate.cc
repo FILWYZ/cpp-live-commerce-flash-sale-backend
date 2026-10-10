@@ -10,19 +10,25 @@ namespace {
 
 constexpr const char* kConfigureScript =
     "if redis.call('EXISTS', KEYS[1])==1 then "
-    "if redis.call('HGET', KEYS[1], 'quota')~=ARGV[1] then return 0 end; return 2 end; "
+    "if redis.call('HGET', KEYS[1], 'quota')~=ARGV[1] then "
+    "if redis.call('HGET', KEYS[1], 'state')~='created' or (tonumber(redis.call('HGET', KEYS[1], 'admitted')) or 0)>0 then return 0 end; "
+    "redis.call('HSET', KEYS[1], 'quota', ARGV[1]); return 3 end; return 2 end; "
     "redis.call('HSET', KEYS[1], 'state', 'created', 'quota', ARGV[1], 'admitted', '0'); return 1";
+constexpr const char* kSynchronizeScript =
+    "if redis.call('EXISTS', KEYS[1])==0 then return 0 end; "
+    "redis.call('HSET', KEYS[1], 'state', ARGV[1]); return 1";
 constexpr const char* kTransitionScript =
     "local state=redis.call('HGET', KEYS[1], 'state'); "
     "if state==ARGV[2] then return 1 end; "
     "if ARGV[2]=='preheating' and (state=='running' or state=='finished') then return 1 end; "
     "if ARGV[2]=='running' and state=='finished' then return 1 end; "
+    "if ARGV[2]=='finished' and state=='paused' then redis.call('HSET', KEYS[1], 'state', 'finished'); return 1 end; "
     "if state ~= ARGV[1] then return 0 end; "
     "redis.call('HSET', KEYS[1], 'state', ARGV[2]); return 1";
 constexpr const char* kAcquireScript =
     "local state=redis.call('HGET', KEYS[1], 'state'); "
     "if state=='created' or state=='preheating' then return -1 end; "
-    "if state=='finished' then return -2 end; "
+    "if state=='finished' then return -2 end; if state=='paused' then return -3 end; "
     "if redis.call('SISMEMBER', KEYS[2], ARGV[1])==1 then return 2 end; "
     "local admitted=tonumber(redis.call('HGET', KEYS[1], 'admitted')) or 0; "
     "local quota=tonumber(redis.call('HGET', KEYS[1], 'quota')) or 0; "
@@ -57,6 +63,21 @@ common::Status RedisFlashSaleGate::configure(const std::string& promotion_id, st
     return result == 0 ? common::Status::FailedPrecondition("Redis admission quota mismatch") : common::Status::Ok();
 }
 
+common::Status RedisFlashSaleGate::synchronize(const std::string& promotion_id, AdmissionState state) {
+    const char* value = "created";
+    switch (state) {
+        case AdmissionState::kCreated: value = "created"; break;
+        case AdmissionState::kPreheating: value = "preheating"; break;
+        case AdmissionState::kRunning: value = "running"; break;
+        case AdmissionState::kPaused: value = "paused"; break;
+        case AdmissionState::kFinished: value = "finished"; break;
+    }
+    std::int64_t result = 0;
+    const auto status = run(redis_, kSynchronizeScript, {metaKey(promotion_id)}, {value}, &result);
+    if (!status.ok()) return status;
+    return result == 1 ? common::Status::Ok() : common::Status::NotFound("Redis campaign admission state is missing");
+}
+
 common::Status RedisFlashSaleGate::transition(const std::string& promotion_id, const char* expected, const char* next) {
     std::int64_t result = 0;
     const auto status = run(redis_, kTransitionScript, {metaKey(promotion_id)}, {expected, next}, &result);
@@ -72,6 +93,14 @@ common::Status RedisFlashSaleGate::start(const std::string& promotion_id) {
     return transition(promotion_id, "preheating", "running");
 }
 
+common::Status RedisFlashSaleGate::pause(const std::string& promotion_id) {
+    return transition(promotion_id, "running", "paused");
+}
+
+common::Status RedisFlashSaleGate::resume(const std::string& promotion_id) {
+    return transition(promotion_id, "paused", "running");
+}
+
 common::Status RedisFlashSaleGate::finish(const std::string& promotion_id) {
     return transition(promotion_id, "running", "finished");
 }
@@ -85,7 +114,8 @@ common::Status RedisFlashSaleGate::tryAcquire(const std::string& promotion_id, c
     decision->code = result == 1 ? AdmissionCode::kAccepted :
         (result == 2 ? AdmissionCode::kDuplicate :
          (result == 0 ? AdmissionCode::kExhausted :
-          (result == -2 ? AdmissionCode::kFinished : AdmissionCode::kNotStarted)));
+          (result == -2 ? AdmissionCode::kFinished :
+           (result == -3 ? AdmissionCode::kPaused : AdmissionCode::kNotStarted))));
     return common::Status::Ok();
 }
 

@@ -31,6 +31,14 @@ ECOMMERCE_MYSQL_TEST_DATABASE=ecommerce \
 ./build/mysql_transaction_test
 ```
 
+可用 Docker daemon、Redis/MySQL/Kafka 客户端开发库时，也可直接运行统一外部验收脚本。脚本会等待 Redis、MySQL 和 Redpanda 健康后，构建外部测试并执行 CTest；依赖容器会保持运行，数据保留在 Compose 持久化卷中：
+
+```bash
+./deploy/scripts/external_validation.sh
+```
+
+RocketMQ SDK/Proxy 的编译与运行验收仍需单独按 `deploy/README.md` 配置；该脚本不宣称覆盖 RocketMQ。
+
 长稳样本：
 
 ```bash

@@ -22,7 +22,7 @@ public:
                                             live::business::order::Order* order) override {
         if (order == nullptr) return live::common::Status::InvalidArgument("order output missing");
         *order = {message.order_id, message.idempotency_key, message.user_id, message.sku_id,
-                  message.quantity, live::business::order::OrderState::kCreated};
+                  message.quantity, live::business::order::OrderState::kPendingPayment};
         return live::common::Status::Ok();
     }
 };
@@ -32,6 +32,13 @@ int configuredSeconds() {
     if (value == nullptr) return 30;
     const int seconds = std::atoi(value);
     return seconds > 0 && seconds <= 300 ? seconds : 30;
+}
+
+int configuredWorkers() {
+    const char* value = std::getenv("FLASH_SOAK_WORKERS");
+    if (value == nullptr) return 16;
+    const int workers = std::atoi(value);
+    return workers > 0 && workers <= 256 ? workers : 16;
 }
 
 }  // namespace
@@ -55,7 +62,9 @@ int main() {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> queued{0};
     std::vector<std::thread> producers;
-    for (int worker = 0; worker < 16; ++worker) {
+    const int worker_count = configuredWorkers();
+    const auto producer_start = std::chrono::steady_clock::now();
+    for (int worker = 0; worker < worker_count; ++worker) {
         producers.emplace_back([&] {
             std::uint64_t sequence = 0;
             while (running.load(std::memory_order_relaxed)) {
@@ -78,6 +87,7 @@ int main() {
     std::this_thread::sleep_for(std::chrono::seconds(configuredSeconds()));
     running.store(false, std::memory_order_relaxed);
     for (auto& producer : producers) producer.join();
+    const double producer_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - producer_start).count();
     while (queue.pending() != 0) {
         const auto status = consumer.processOnce(std::chrono::milliseconds(100));
         if (!status.ok() && !status.isIncomplete()) {
@@ -89,14 +99,19 @@ int main() {
 
     live::business::inventory::StockSnapshot stock;
     if (!inventory.queryStock("soak-sku", &stock).ok() || stock.available < 0 || stock.reserved < 0 || stock.sold < 0 ||
-        stock.available + stock.reserved + stock.sold != kInitialStock || stock.reserved != 0 || queue.pending() != 0 ||
+        stock.available + stock.reserved + stock.sold != kInitialStock ||
+        stock.reserved != static_cast<std::int64_t>(consumer.processed()) || stock.sold != 0 || queue.pending() != 0 ||
         queued.load() != consumer.processed()) {
         std::cerr << "soak invariant failed: available=" << stock.available << " reserved=" << stock.reserved
                   << " sold=" << stock.sold << " queue=" << queue.pending() << " queued=" << queued.load()
                   << " processed=" << consumer.processed() << '\n';
         return 1;
     }
-    std::cout << "flash_sale_soak_test passed: seconds=" << configuredSeconds()
-              << " submitted=" << submitted.load() << " processed=" << consumer.processed() << '\n';
+    std::cout << "flash_sale_soak_test passed: seconds=" << configuredSeconds() << " workers=" << worker_count
+              << " submitted=" << submitted.load() << " queued=" << queued.load() << " processed=" << consumer.processed()
+              << " queue_drained=" << (queue.pending() == 0)
+              << " offered_rps=" << (producer_seconds > 0.0 ? submitted.load() / producer_seconds : 0.0)
+              << " admitted_rps=" << (producer_seconds > 0.0 ? queued.load() / producer_seconds : 0.0)
+              << " pipeline_rps=" << (producer_seconds > 0.0 ? consumer.processed() / producer_seconds : 0.0) << '\n';
     return 0;
 }

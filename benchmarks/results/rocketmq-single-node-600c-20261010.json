@@ -1,0 +1,70 @@
+{
+  "accepted_202": 600,
+  "accepted_admission_rps": 504.5,
+  "accepted_requests_not_settled": 0,
+  "accepted_requests_reached_terminal_state": 600,
+  "application_configuration": {
+    "campaign_limit": 600,
+    "consumer_workers": 4,
+    "gateway_workers": 8,
+    "initial_stock": 600,
+    "mysql_pool_size": 16
+  },
+  "business_rejected_409": 0,
+  "compose_project": "internship-closeout-load600-20261010",
+  "concurrency": 600,
+  "consumer_stats": {
+    "flash_sale_consumer_dead_lettered": 0,
+    "flash_sale_consumer_processed": 600,
+    "flash_sale_consumer_rejected": 0,
+    "flash_sale_queue_depth": null,
+    "http_active_connections": 1,
+    "http_requests": 2815,
+    "http_worker_queue_depth": 0
+  },
+  "dead_lettered_commands": 0,
+  "environment": {
+    "container_images": {
+      "gateway": "locally built Docker image",
+      "mysql": "mysql:8.4",
+      "redis": "redis:7-alpine",
+      "redpanda": "redpandadata/redpanda:v24.1.2",
+      "rocketmq": "apache/rocketmq:5.3.2 (single broker; RocketMQ mode only)"
+    },
+    "logical_cpu_count": 10,
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "python_version": "3.14.5"
+  },
+  "http_responses_observed": 600,
+  "http_status_counts": {
+    "202": 600
+  },
+  "latency_ms": {
+    "max": 1153.033,
+    "measured_operation": "authenticated HTTP admission and command publish; setup and order drain excluded",
+    "p50": 1080.593,
+    "p95": 1128.916,
+    "p99": 1146.631
+  },
+  "measured_seconds": 1.189,
+  "mode": "rocketmq",
+  "requests": 600,
+  "rocketmq_broker_dlq_retry_and_replay": "not verified by this load run",
+  "run_id": "438720f65a024bfc",
+  "server_error_rate": 0.0,
+  "session_setup_seconds_excluded": 148.994,
+  "stock": {
+    "available": 0,
+    "reserved": 600,
+    "sold": 0
+  },
+  "stock_invariant_available_plus_reserved_plus_sold_equals_initial": true,
+  "target_submission_rate_rps": null,
+  "terminal_request_states": {
+    "PENDING_PAYMENT": 600
+  },
+  "throttled_429": 0,
+  "throughput_rps": 504.5,
+  "transport_error_rate": 0.0
+}

@@ -31,7 +31,8 @@ bool validRequestId(const std::string& value) {
 }  // namespace
 
 struct HttpServer::Connection : public std::enable_shared_from_this<HttpServer::Connection> {
-    Connection(HttpServer* owner, int fd) : owner(owner), fd(fd), channel(owner->loop_, fd) {}
+    Connection(HttpServer* owner, int fd, std::string client_ip)
+        : owner(owner), fd(fd), client_ip(std::move(client_ip)), channel(owner->loop_, fd) {}
 
     void start() {
         const auto weak = weak_from_this();
@@ -56,6 +57,7 @@ struct HttpServer::Connection : public std::enable_shared_from_this<HttpServer::
         }
         while (input.readableBytes() != 0 && !closed && !request_in_flight) {
             HttpRequest request;
+            request.client_ip = client_ip;
             std::size_t consumed = 0;
             const std::string raw(input.peek(), input.readableBytes());
             const auto parse_status = HttpRequestParser::parse(raw, &request, &consumed);
@@ -158,6 +160,7 @@ struct HttpServer::Connection : public std::enable_shared_from_this<HttpServer::
 
     HttpServer* owner;
     int fd;
+    std::string client_ip;
     network::Channel channel;
     network::Buffer input;
     network::Buffer output;
@@ -171,7 +174,7 @@ HttpServer::HttpServer(network::EventLoop* loop, std::string host, std::uint16_t
                        std::size_t worker_threads, std::size_t worker_queue_capacity)
     : loop_(loop), max_connections_(max_connections), observer_(std::move(observer)),
       acceptor_(std::make_unique<network::TcpAcceptor>(loop, std::move(host), port,
-          [this](int fd) { onConnection(fd); })) {
+          [this](int fd, const std::string& client_ip) { onConnection(fd, client_ip); })) {
     if (worker_threads != 0) worker_pool_ = std::make_unique<common::ThreadPool>(worker_threads, worker_queue_capacity);
 }
 
@@ -209,13 +212,14 @@ void HttpServer::observe(const http::HttpRequest& request, const http::HttpRespo
 
 std::uint16_t HttpServer::port() const { return acceptor_ == nullptr ? 0 : acceptor_->port(); }
 
-void HttpServer::onConnection(int fd) {
+void HttpServer::onConnection(int fd, const std::string& client_ip) {
     if (connections_.size() >= max_connections_) {
         ::close(fd);
         return;
     }
-    auto connection = std::make_shared<Connection>(this, fd);
+    auto connection = std::make_shared<Connection>(this, fd, client_ip);
     connections_.emplace(fd, connection);
+    active_connections_.store(connections_.size(), std::memory_order_relaxed);
     connection->start();
 }
 
@@ -225,6 +229,7 @@ void HttpServer::removeConnection(int fd) {
     loop_->removeChannel(&it->second->channel);
     ::close(fd);
     connections_.erase(it);
+    active_connections_.store(connections_.size(), std::memory_order_relaxed);
 }
 
 }  // namespace live::gateway::http

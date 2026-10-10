@@ -13,6 +13,7 @@ struct HttpRequest {
     std::string target;
     std::string version;
     std::string request_id;
+    std::string client_ip;
     std::unordered_map<std::string, std::string> headers;
     std::string body;
 };

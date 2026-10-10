@@ -18,6 +18,23 @@ common::Status KafkaFlashSaleOrderConsumer::handle(const Event& event) {
         ++dead_lettered_;
         return common::Status::Ok();
     }
+    ::live::business::inventory::InventoryReservationResult reservation;
+    if (const auto reserve_status = inventory_->reserve(message.sku_id, message.quantity, message.order_id, &reservation);
+        !reserve_status.ok()) return reserve_status;
+    if (reservation.decision == ::live::business::inventory::InventoryDecision::kInsufficient) {
+        if (admission_gate_ != nullptr) (void)admission_gate_->rollback(message.promotion_id, message.user_id);
+        {
+            std::lock_guard<std::mutex> lock(attempts_mutex_);
+            attempts_.erase(event.event_id);
+        }
+        ++rejected_;
+        return common::Status::Ok();
+    }
+    if (reservation.decision != ::live::business::inventory::InventoryDecision::kSuccess &&
+        reservation.decision != ::live::business::inventory::InventoryDecision::kDuplicate) {
+        return common::Status::Internal("Kafka flash-sale inventory reservation failed");
+    }
+
     ::live::business::order::Order order;
     if (const auto status = repository_->persistQueuedOrder(message, &order); !status.ok()) {
         std::lock_guard<std::mutex> lock(attempts_mutex_);
@@ -33,25 +50,8 @@ common::Status KafkaFlashSaleOrderConsumer::handle(const Event& event) {
         return common::Status::Ok();
     }
 
-    ::live::business::inventory::InventoryReservationResult result;
-    const auto confirm_status = inventory_->confirm(message.sku_id, message.order_id, &result);
-    if (!confirm_status.ok() || (result.decision != ::live::business::inventory::InventoryDecision::kSuccess &&
-                                 result.decision != ::live::business::inventory::InventoryDecision::kDuplicate)) {
-        std::lock_guard<std::mutex> lock(attempts_mutex_);
-        auto& count = attempts_[event.event_id];
-        if (++count < max_attempts_) return confirm_status.ok()
-            ? common::Status::Internal("Kafka flash-sale inventory confirmation failed") : confirm_status;
-        if (dead_letter_producer_ == nullptr || dead_letter_topic_.empty()) {
-            return confirm_status.ok() ? common::Status::Internal("Kafka flash-sale inventory confirmation failed") : confirm_status;
-        }
-        const auto dlq_status = dead_letter_producer_->publish({
-            "dlq-" + event.event_id, dead_letter_topic_, event.key, event.payload, event.sequence});
-        if (!dlq_status.ok()) return confirm_status;
-        (void)compensate(message);
-        attempts_.erase(event.event_id);
-        ++dead_lettered_;
-        return common::Status::Ok();
-    }
+    // Keep the reservation while the order is pending payment. A later paid
+    // or expired transition confirms or releases it idempotently.
     {
         std::lock_guard<std::mutex> lock(attempts_mutex_);
         attempts_.erase(event.event_id);
@@ -69,6 +69,12 @@ common::Status KafkaFlashSaleOrderConsumer::sendDeadLetter(const Event& event) {
 }
 
 common::Status KafkaFlashSaleOrderConsumer::compensate(const FlashSaleOrderMessage& message) {
+    if (repository_ != nullptr) {
+        ::live::business::order::Order durable_order;
+        const auto lookup = repository_->getOrder(message.order_id, &durable_order);
+        if (lookup.ok()) return common::Status::FailedPrecondition("cannot release reservation for a persisted order");
+        if (lookup.code() != common::ErrorCode::kNotFound) return lookup;
+    }
     ::live::business::inventory::InventoryReservationResult result;
     if (inventory_ != nullptr) (void)inventory_->release(message.sku_id, message.order_id, &result);
     if (admission_gate_ != nullptr) (void)admission_gate_->rollback(message.promotion_id, message.user_id);

@@ -17,7 +17,7 @@ class IOrderTransactionStore;
 
 // A flash-sale order is created after the admission decision and is completed
 // asynchronously by the consumer.
-enum class OrderState { kCreated };
+enum class OrderState { kPendingPayment, kPaid, kExpired, kCancelled };
 
 struct Order {
     std::string id;
@@ -25,7 +25,8 @@ struct Order {
     std::string user_id;
     std::string sku_id;
     std::int64_t quantity{0};
-    OrderState state{OrderState::kCreated};
+    OrderState state{OrderState::kPendingPayment};
+    std::int64_t unit_price_cents{0};
 };
 
 class OrderService {
@@ -43,6 +44,11 @@ public:
                                                const std::string& sku_id, std::int64_t quantity,
                                                const std::string& idempotency_key, Order* order);
     common::Status getOrder(const std::string& order_id, Order* order) const;
+    common::Status transitionOrder(const std::string& order_id, OrderState expected, OrderState next,
+                                   Order* order);
+    common::Status confirmPayment(const std::string& order_id, const std::string& provider,
+                                 const std::string& provider_transaction_id, std::int64_t amount_cents,
+                                 Order* order);
 
 private:
     static std::string eventPayload(const Order& order);

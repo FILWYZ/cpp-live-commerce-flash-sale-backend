@@ -14,7 +14,7 @@ class EventLoop;
 
 class TcpAcceptor {
 public:
-    using NewConnectionCallback = std::function<void(int)>;
+    using NewConnectionCallback = std::function<void(int, const std::string&)>;
 
     TcpAcceptor(EventLoop* loop, std::string host, std::uint16_t port, NewConnectionCallback callback);
     ~TcpAcceptor();

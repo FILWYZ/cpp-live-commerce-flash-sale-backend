@@ -17,6 +17,12 @@ public:
     virtual ~IOrderQueue() = default;
     virtual common::Status push(const FlashSaleOrderMessage& message) = 0;
     virtual common::Status pop(FlashSaleOrderMessage* message, std::chrono::milliseconds timeout) = 0;
+    // Durable transports acknowledge only after business processing succeeds.
+    // In-process queues have no broker acknowledgement, so the default is a no-op.
+    virtual common::Status acknowledge(const FlashSaleOrderMessage& message, bool processed) {
+        (void)message; (void)processed;
+        return common::Status::Ok();
+    }
     virtual std::size_t pending() const = 0;
 };
 

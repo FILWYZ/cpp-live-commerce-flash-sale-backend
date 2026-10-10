@@ -77,6 +77,21 @@ bool RedisKVStore::connected() const {
     return !closing_ && !connections_.empty();
 }
 
+common::Status RedisKVStore::ping() {
+    auto connection = acquire();
+    if (connection == nullptr) return common::Status::FailedPrecondition("Redis is not connected");
+    auto* reply = static_cast<redisReply*>(redisCommand(connection->context, "PING"));
+    if (reply == nullptr) {
+        const auto status = redisError(connection->context);
+        release(std::move(connection));
+        return status;
+    }
+    const bool ok = reply->type == REDIS_REPLY_STATUS && std::string(reply->str, reply->len) == "PONG";
+    freeReplyObject(reply);
+    release(std::move(connection));
+    return ok ? common::Status::Ok() : common::Status::Internal("unexpected Redis PING response");
+}
+
 std::shared_ptr<RedisKVStore::Connection> RedisKVStore::acquire(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
     if (!condition_.wait_for(lock, timeout, [this] { return closing_ || !idle_.empty(); })) return {};
@@ -219,6 +234,53 @@ common::Status RedisKVStore::evalInteger(const std::string& script, const std::v
     return common::Status::Internal("Redis script disappeared while executing");
 }
 
+common::Status RedisKVStore::evalString(const std::string& script, const std::vector<std::string>& keys,
+                                         const std::vector<std::string>& arguments, std::string* result) {
+    if (script.empty() || result == nullptr) return common::Status::InvalidArgument("invalid Redis script arguments");
+    auto connection = acquire();
+    if (connection == nullptr) return common::Status::FailedPrecondition("Redis is not connected");
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        auto script_it = connection->script_shas.find(script);
+        if (script_it == connection->script_shas.end()) {
+            auto* load_reply = static_cast<redisReply*>(redisCommand(connection->context, "SCRIPT LOAD %b", script.data(), script.size()));
+            if (load_reply == nullptr) {
+                const auto status = redisError(connection->context);
+                release(std::move(connection));
+                return status;
+            }
+            if (load_reply->type != REDIS_REPLY_STRING || load_reply->str == nullptr) {
+                const std::string message = load_reply->str == nullptr ? "Redis SCRIPT LOAD failed" : load_reply->str;
+                freeReplyObject(load_reply); release(std::move(connection)); return common::Status::Internal(message);
+            }
+            script_it = connection->script_shas.emplace(script, std::string(load_reply->str, load_reply->len)).first;
+            freeReplyObject(load_reply);
+        }
+        std::vector<std::string> storage{"EVALSHA", script_it->second, std::to_string(keys.size())};
+        storage.insert(storage.end(), keys.begin(), keys.end());
+        storage.insert(storage.end(), arguments.begin(), arguments.end());
+        std::vector<const char*> argv; std::vector<std::size_t> lengths;
+        for (const auto& item : storage) { argv.push_back(item.data()); lengths.push_back(item.size()); }
+        auto* reply = static_cast<redisReply*>(redisCommandArgv(
+            connection->context, static_cast<int>(argv.size()), argv.data(), lengths.data()));
+        if (reply == nullptr) { const auto status = redisError(connection->context); release(std::move(connection)); return status; }
+        if (reply->type == REDIS_REPLY_ERROR && reply->str != nullptr &&
+            std::string_view(reply->str, reply->len).find("NOSCRIPT") != std::string_view::npos) {
+            connection->script_shas.erase(script); freeReplyObject(reply); continue;
+        }
+        if (reply->type == REDIS_REPLY_NIL) {
+            result->clear();
+        } else if (reply->type == REDIS_REPLY_STRING) {
+            result->assign(reply->str, reply->len);
+        } else {
+            const std::string message = reply->str == nullptr ? "Redis script did not return string" : reply->str;
+            freeReplyObject(reply); release(std::move(connection)); return common::Status::Internal(message);
+        }
+        freeReplyObject(reply); release(std::move(connection)); return common::Status::Ok();
+    }
+    release(std::move(connection));
+    return common::Status::Internal("Redis script disappeared while executing");
+}
+
 common::Status RedisKVStore::hashGet(const std::string& key, const std::string& field, std::string* value) {
     if (key.empty() || field.empty() || value == nullptr) return common::Status::InvalidArgument("invalid Redis HGET");
     auto connection = acquire();
@@ -292,6 +354,16 @@ common::Status RedisKVStore::listPush(const std::string& key, const std::string&
     return ok ? common::Status::Ok() : common::Status::Internal("Redis LPUSH failed");
 }
 
+common::Status RedisKVStore::listPushBounded(const std::string& key, const std::string& value, std::size_t max_length) {
+    if (key.empty() || value.empty() || max_length == 0) return common::Status::InvalidArgument("invalid bounded Redis LPUSH");
+    static const std::string script =
+        "local n=redis.call('LLEN',KEYS[1]); if n>=tonumber(ARGV[2]) then return 0 end; "
+        "redis.call('LPUSH',KEYS[1],ARGV[1]); return 1";
+    std::int64_t pushed = 0;
+    if (const auto status = evalInteger(script, {key}, {value, std::to_string(max_length)}, &pushed); !status.ok()) return status;
+    return pushed == 1 ? common::Status::Ok() : common::Status::ResourceExhausted("Redis flash-sale queue is full");
+}
+
 common::Status RedisKVStore::listBlockingPop(const std::string& key, std::chrono::milliseconds timeout, std::string* value) {
     if (key.empty() || value == nullptr || timeout.count() < 0) return common::Status::InvalidArgument("invalid Redis BRPOP");
     auto connection = acquire(timeout + std::chrono::seconds(1));
@@ -322,6 +394,49 @@ common::Status RedisKVStore::listLength(const std::string& key, std::size_t* len
     }
     *length = static_cast<std::size_t>(reply->integer);
     freeReplyObject(reply); release(std::move(connection)); return common::Status::Ok();
+}
+
+common::Status RedisKVStore::listRange(const std::string& key, std::int64_t start, std::int64_t stop,
+                                      std::vector<std::string>* values) {
+    if (key.empty() || values == nullptr || start < 0 || stop < start)
+        return common::Status::InvalidArgument("invalid Redis LRANGE");
+    values->clear();
+    auto connection = acquire();
+    if (connection == nullptr) return common::Status::FailedPrecondition("Redis is not connected");
+    auto* reply = static_cast<redisReply*>(redisCommand(connection->context, "LRANGE %b %lld %lld",
+        key.data(), key.size(), static_cast<long long>(start), static_cast<long long>(stop)));
+    if (reply == nullptr) { const auto status = redisError(connection->context); release(std::move(connection)); return status; }
+    if (reply->type != REDIS_REPLY_ARRAY) {
+        freeReplyObject(reply);
+        release(std::move(connection));
+        return common::Status::Internal("unexpected Redis LRANGE reply");
+    }
+    values->reserve(reply->elements);
+    for (std::size_t i = 0; i < reply->elements; ++i) {
+        const auto* element = reply->element[i];
+        if (element == nullptr || element->type != REDIS_REPLY_STRING) {
+            values->clear();
+            freeReplyObject(reply);
+            release(std::move(connection));
+            return common::Status::Internal("unexpected Redis LRANGE item");
+        }
+        values->emplace_back(element->str, element->len);
+    }
+    freeReplyObject(reply);
+    release(std::move(connection));
+    return common::Status::Ok();
+}
+
+common::Status RedisKVStore::listMoveBounded(const std::string& source, const std::string& destination,
+    std::size_t max_destination_length, const std::string& expected_tail, std::int64_t* result) {
+    if (source.empty() || destination.empty() || source == destination || max_destination_length == 0 ||
+        expected_tail.empty() || result == nullptr)
+        return common::Status::InvalidArgument("invalid bounded Redis list move");
+    static const std::string script =
+        "if redis.call('LLEN',KEYS[2])>=tonumber(ARGV[1]) then return -1 end; "
+        "local v=redis.call('LINDEX',KEYS[1],-1); if not v then return 0 end; "
+        "if v~=ARGV[2] then return -2 end; redis.call('RPOPLPUSH',KEYS[1],KEYS[2]); return 1";
+    return evalInteger(script, {source, destination}, {std::to_string(max_destination_length), expected_tail}, result);
 }
 
 }  // namespace live::kv

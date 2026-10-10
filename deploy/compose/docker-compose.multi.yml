@@ -1,4 +1,4 @@
-# Two API instances sharing Redis sessions/admission/inventory and MySQL
+# Two API gateways and a separate background worker sharing Redis and MySQL
 # orders. Start with:
 # docker compose -f deploy/compose/docker-compose.multi.yml up --build
 services:
@@ -7,8 +7,9 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     ports:
-      - "8080:8080"
+      - "${ECOMMERCE_GATEWAY_1_PUBLISHED_PORT:-8080}:8080"
     environment: &gateway-env
+      ECOMMERCE_PROCESS_ROLE: gateway
       ECOMMERCE_INVENTORY_MODE: redis
       ECOMMERCE_FLASH_SALE_QUEUE: redis
       ECOMMERCE_REDIS_HOST: redis
@@ -35,7 +36,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     ports:
-      - "8081:8080"
+      - "${ECOMMERCE_GATEWAY_2_PUBLISHED_PORT:-8081}:8080"
     environment:
       <<: *gateway-env
     depends_on:
@@ -46,10 +47,25 @@ services:
       - gateway-2-data:/tmp
     restart: unless-stopped
 
+  worker:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    environment:
+      <<: *gateway-env
+      ECOMMERCE_PROCESS_ROLE: worker
+    depends_on:
+      redis: {condition: service_healthy}
+      redpanda: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+    volumes:
+      - worker-data:/tmp
+    restart: unless-stopped
+
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v24.1.2
     command: redpanda start --overprovisioned --smp 1 --memory 1G --reserve-memory 0M --check=false --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092 --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
-    ports: ["19092:19092"]
+    ports: ["${ECOMMERCE_REDPANDA_PUBLISHED_PORT:-19092}:19092"]
     healthcheck:
       test: ["CMD", "rpk", "cluster", "health"]
       interval: 5s
@@ -59,7 +75,7 @@ services:
   redis:
     image: redis:7-alpine
     command: redis-server --appendonly yes
-    ports: ["6379:6379"]
+    ports: ["${ECOMMERCE_REDIS_PUBLISHED_PORT:-6379}:6379"]
     volumes: [redis-data:/data]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -74,7 +90,7 @@ services:
       MYSQL_USER: ecommerce
       MYSQL_PASSWORD: ecommerce
       MYSQL_ROOT_PASSWORD: root-password
-    ports: ["13306:3306"]
+    ports: ["${ECOMMERCE_MYSQL_PUBLISHED_PORT:-13306}:3306"]
     volumes:
       - mysql-data:/var/lib/mysql
       - ../../src/storage/mysql/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
@@ -87,5 +103,6 @@ services:
 volumes:
   gateway-1-data:
   gateway-2-data:
+  worker-data:
   redis-data:
   mysql-data:

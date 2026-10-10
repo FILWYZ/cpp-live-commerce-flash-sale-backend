@@ -1,6 +1,8 @@
 build/
 build-*/
 cmake-build-*/
+__pycache__/
+output/
 .cache/
 compile_commands.json
 *.log

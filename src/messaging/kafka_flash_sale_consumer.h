@@ -33,6 +33,7 @@ public:
     common::Status start(const std::string& brokers, const std::string& group_id);
     void stop();
     std::size_t processed() const { return processed_.load(); }
+    std::size_t rejected() const { return rejected_.load(); }
     std::size_t deadLettered() const { return dead_lettered_.load(); }
 
 private:
@@ -52,6 +53,7 @@ private:
     std::atomic<bool> running_{false};
     std::thread worker_;
     std::atomic<std::size_t> processed_{0};
+    std::atomic<std::size_t> rejected_{0};
     std::atomic<std::size_t> dead_lettered_{0};
     std::mutex attempts_mutex_;
     std::unordered_map<std::string, std::size_t> attempts_;

@@ -26,6 +26,7 @@ public:
                            std::size_t pool_size = 8);
     void close();
     bool connected() const;
+    common::Status ping();
 
     common::Status get(const std::string& key, std::string* value) override;
     common::Status set(const std::string& key, const std::string& value,
@@ -40,14 +41,27 @@ public:
     // all keys belong to the same Redis hash slot when Redis Cluster is used.
     common::Status evalInteger(const std::string& script, const std::vector<std::string>& keys,
                                const std::vector<std::string>& arguments, std::int64_t* result);
+    // Executes a Lua script returning a bulk string. A nil reply is returned as
+    // an empty string so scripts can express an empty queue without an error.
+    common::Status evalString(const std::string& script, const std::vector<std::string>& keys,
+                              const std::vector<std::string>& arguments, std::string* result);
     common::Status hashGet(const std::string& key, const std::string& field, std::string* value);
     common::Status hashGetMany(const std::string& key, const std::vector<std::string>& fields,
                                std::vector<std::string>* values);
     common::Status hashSet(const std::string& key, const std::string& field, const std::string& value);
     common::Status listPush(const std::string& key, const std::string& value);
+    common::Status listPushBounded(const std::string& key, const std::string& value, std::size_t max_length);
     common::Status listBlockingPop(const std::string& key, std::chrono::milliseconds timeout,
                                    std::string* value);
     common::Status listLength(const std::string& key, std::size_t* length);
+    common::Status listRange(const std::string& key, std::int64_t start, std::int64_t stop,
+                            std::vector<std::string>* values);
+    // Atomically moves the oldest list item to the head of another list unless
+    // the destination's bounded capacity has been reached. Keys must share a
+    // Redis Cluster hash slot.
+    common::Status listMoveBounded(const std::string& source, const std::string& destination,
+                                   std::size_t max_destination_length, const std::string& expected_tail,
+                                   std::int64_t* result);
 
 private:
     struct Connection;

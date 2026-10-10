@@ -127,7 +127,10 @@ int main() {
     status = producer.start(kafka_brokers, "ecommerce-smoke-producer");
     if (!status.ok()) { std::cerr << "Kafka producer start failed: " << status.message() << '\n'; return 1; }
     live::messaging::Event event{"smoke-event", "ecommerce-smoke", "key-1", "payload-1", 0};
-    if (!producer.publish(event).ok() || !producer.flush(5000).ok()) { std::cerr << "Kafka publish failed\n"; return 1; }
+    status = producer.publish(event);
+    if (!status.ok()) { std::cerr << "Kafka publish failed: " << status.message() << '\n'; return 1; }
+    status = producer.flush(5000);
+    if (!status.ok()) { std::cerr << "Kafka flush failed: " << status.message() << '\n'; return 1; }
 
     bool received = false;
     for (int i = 0; i < 10 && !received; ++i) {

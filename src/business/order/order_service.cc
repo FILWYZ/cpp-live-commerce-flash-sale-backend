@@ -80,6 +80,37 @@ common::Status OrderService::getOrder(const std::string& order_id, Order* order)
     return common::Status::Ok();
 }
 
+common::Status OrderService::transitionOrder(const std::string& order_id, OrderState expected,
+                                             OrderState next, Order* order) {
+    if (order_id.empty() || order == nullptr || expected == next) {
+        return common::Status::InvalidArgument("invalid order transition");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = orders_.find(order_id);
+    if (it == orders_.end()) {
+        if (transaction_store_ == nullptr) return common::Status::NotFound("order not found");
+        return transaction_store_->transitionOrder(order_id, expected, next, order);
+    }
+    if (it->second.state == next) { *order = it->second; return common::Status::Ok(); }
+    if (it->second.state != expected) return common::Status::Aborted("order state changed concurrently");
+    it->second.state = next;
+    if (const auto status = persist(it->second); !status.ok()) {
+        it->second.state = expected;
+        return status;
+    }
+    *order = it->second;
+    return common::Status::Ok();
+}
+
+common::Status OrderService::confirmPayment(const std::string& order_id, const std::string& provider,
+    const std::string& provider_transaction_id, std::int64_t amount_cents, Order* order) {
+    if (order_id.empty() || provider.empty() || provider_transaction_id.empty() || amount_cents < 0 || order == nullptr)
+        return common::Status::InvalidArgument("invalid payment confirmation");
+    if (transaction_store_ != nullptr)
+        return transaction_store_->confirmPayment(order_id, provider, provider_transaction_id, amount_cents, order);
+    return transitionOrder(order_id, OrderState::kPendingPayment, OrderState::kPaid, order);
+}
+
 std::string OrderService::eventPayload(const Order& order) {
     std::ostringstream out;
     out << order.id << '|' << order.user_id << '|' << order.sku_id << '|' << order.quantity;
@@ -101,7 +132,7 @@ bool OrderService::deserialize(const std::string& value, Order* order) {
            static_cast<bool>(std::getline(input, order->sku_id, '\t')) &&
            static_cast<bool>(input >> order->quantity) && input.get() == '\t' &&
            static_cast<bool>(input >> state) && state >= 0 && state <= 3 &&
-           (order->state = OrderState::kCreated, true);
+           (order->state = static_cast<OrderState>(state), true);
 }
 
 common::Status OrderService::persist(const Order& order) {

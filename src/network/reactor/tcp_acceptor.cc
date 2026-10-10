@@ -94,7 +94,9 @@ void TcpAcceptor::handleRead() {
             ::close(connection_fd);
             continue;
         }
-        callback_(connection_fd);
+        char peer_address[INET_ADDRSTRLEN]{};
+        const char* peer = ::inet_ntop(AF_INET, &address.sin_addr, peer_address, sizeof(peer_address));
+        callback_(connection_fd, peer == nullptr ? std::string{} : std::string(peer));
     }
 }
 

@@ -3,9 +3,31 @@
 #include <librdkafka/rdkafka.h>
 
 #include <cstring>
+#include <chrono>
+#include <memory>
+#include <mutex>
 
 namespace live::messaging {
 namespace {
+
+struct DeliveryResult {
+    std::mutex mutex;
+    bool complete{false};
+    common::Status status{common::Status::Internal("Kafka delivery is incomplete")};
+};
+
+void deliveryReport(rd_kafka_t*, const rd_kafka_message_t* message, void*) {
+    auto* holder = static_cast<std::shared_ptr<DeliveryResult>*>(message->_private);
+    if (holder == nullptr) return;
+    auto result = *holder;
+    delete holder;
+    {
+        std::lock_guard<std::mutex> lock(result->mutex);
+        result->status = message->err == RD_KAFKA_RESP_ERR_NO_ERROR
+            ? common::Status::Ok() : common::Status::Internal(rd_kafka_message_errstr(message));
+        result->complete = true;
+    }
+}
 
 common::Status error(const char* message) { return common::Status::Internal(message == nullptr ? "Kafka error" : message); }
 
@@ -19,24 +41,40 @@ common::Status KafkaProducer::start(const std::string& brokers, const std::strin
     rd_kafka_conf_t* conf = rd_kafka_conf_new();
     if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers.c_str(), error_buffer, sizeof(error_buffer)) != RD_KAFKA_CONF_OK ||
         rd_kafka_conf_set(conf, "client.id", client_id.c_str(), error_buffer, sizeof(error_buffer)) != RD_KAFKA_CONF_OK ||
-        rd_kafka_conf_set(conf, "enable.idempotence", "true", error_buffer, sizeof(error_buffer)) != RD_KAFKA_CONF_OK) {
+        rd_kafka_conf_set(conf, "enable.idempotence", "true", error_buffer, sizeof(error_buffer)) != RD_KAFKA_CONF_OK ||
+        rd_kafka_conf_set(conf, "acks", "all", error_buffer, sizeof(error_buffer)) != RD_KAFKA_CONF_OK ||
+        rd_kafka_conf_set(conf, "delivery.timeout.ms", "5000", error_buffer, sizeof(error_buffer)) != RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
         return error(error_buffer);
     }
+    rd_kafka_conf_set_dr_msg_cb(conf, deliveryReport);
     client_ = rd_kafka_new(RD_KAFKA_PRODUCER, conf, error_buffer, sizeof(error_buffer));
     return client_ == nullptr ? error(error_buffer) : common::Status::Ok();
 }
 
 common::Status KafkaProducer::publish(const Event& event) {
     if (client_ == nullptr || event.topic.empty()) return common::Status::FailedPrecondition("Kafka producer is not started");
+    auto delivery = std::make_shared<DeliveryResult>();
+    auto* opaque = new std::shared_ptr<DeliveryResult>(delivery);
     const auto result = rd_kafka_producev(client_, RD_KAFKA_V_TOPIC(event.topic.c_str()),
         RD_KAFKA_V_KEY(const_cast<char*>(event.key.data()), event.key.size()),
         RD_KAFKA_V_VALUE(const_cast<char*>(event.payload.data()), event.payload.size()),
         RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+        RD_KAFKA_V_OPAQUE(opaque),
         RD_KAFKA_V_END);
-    if (result != RD_KAFKA_RESP_ERR_NO_ERROR) return error(rd_kafka_err2str(result));
-    rd_kafka_poll(client_, 0);
-    return common::Status::Ok();
+    if (result != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        delete opaque;
+        return error(rd_kafka_err2str(result));
+    }
+    // flush() dispatches delivery reports while waiting for broker ACKs. A
+    // condition-variable wait here would stall because librdkafka callbacks
+    // run only when the application polls or flushes the producer.
+    const auto flush_result = rd_kafka_flush(client_, 6000);
+    if (flush_result != RD_KAFKA_RESP_ERR_NO_ERROR)
+        return common::Status::Internal("Kafka delivery acknowledgement timed out");
+    std::lock_guard<std::mutex> lock(delivery->mutex);
+    if (!delivery->complete) return common::Status::Internal("Kafka delivery report was not received");
+    return delivery->status;
 }
 
 common::Status KafkaProducer::flush(std::uint32_t timeout_ms) {

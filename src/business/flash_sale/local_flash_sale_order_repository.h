@@ -12,6 +12,12 @@ public:
 
     common::Status persistQueuedOrder(const ::live::messaging::FlashSaleOrderMessage& message,
                                       ::live::business::order::Order* order) override;
+    common::Status getOrder(const std::string& order_id,
+                            ::live::business::order::Order* order) const override;
+    common::Status transitionOrder(const std::string& order_id,
+                                   ::live::business::order::OrderState expected,
+                                   ::live::business::order::OrderState next,
+                                   ::live::business::order::Order* order) override;
 
 private:
     ::live::business::order::OrderService* orders_{nullptr};

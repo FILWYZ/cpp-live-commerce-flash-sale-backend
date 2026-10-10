@@ -7,6 +7,29 @@
 
 namespace live::messaging {
 
+common::Status KafkaDlqOperator::peek(const std::string& brokers, const std::string& dlq_topic,
+                                      std::size_t max_messages, std::vector<Event>* events) {
+    if (brokers.empty() || dlq_topic.empty() || max_messages == 0 || events == nullptr) {
+        return common::Status::InvalidArgument("invalid DLQ inspection arguments");
+    }
+    events->clear();
+    KafkaConsumer consumer;
+    static std::atomic<std::uint64_t> sequence{1};
+    const std::string group = "dlq-inspect-" + std::to_string(sequence.fetch_add(1));
+    if (const auto status = consumer.start(brokers, group, {dlq_topic}); !status.ok()) return status;
+    auto last_message = std::chrono::steady_clock::now();
+    while (events->size() < max_messages && std::chrono::steady_clock::now() - last_message < std::chrono::seconds(2)) {
+        const auto status = consumer.poll(250, [&](const Event& event) {
+            events->push_back(event);
+            last_message = std::chrono::steady_clock::now();
+            return common::Status::Ok();
+        });
+        if (!status.ok()) { consumer.stop(); return status; }
+    }
+    consumer.stop();
+    return common::Status::Ok();
+}
+
 common::Status KafkaDlqOperator::replay(const std::string& brokers, const std::string& dlq_topic,
                                         const std::string& target_topic, std::size_t max_messages,
                                         std::size_t* replayed) {

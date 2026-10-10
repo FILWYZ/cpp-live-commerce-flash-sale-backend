@@ -18,7 +18,7 @@ void check(bool condition, const char* message) {
 }
 
 void testRandomTokenAndLogout() {
-    live::business::user::UserService users(nullptr, std::chrono::seconds(1));
+    live::business::user::UserService users(nullptr, std::chrono::seconds(3));
     live::business::user::User user;
     check(users.registerUser("security-user", "secret", live::business::user::UserRole::kCustomer, &user).ok(), "user register");
     live::business::user::Session first;
@@ -33,7 +33,7 @@ void testRandomTokenAndLogout() {
     check(users.authenticate(first.token, &authenticated).code() == live::common::ErrorCode::kUnauthenticated,
           "logged out session remained valid");
     check(users.authenticate(second.token, &authenticated).ok(), "second session should remain valid before TTL");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));
     check(users.authenticate(second.token, &authenticated).code() == live::common::ErrorCode::kUnauthenticated,
           "expired session remained valid");
 }

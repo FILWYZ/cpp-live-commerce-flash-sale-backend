@@ -26,7 +26,7 @@ public:
         if (order == nullptr) return live::common::Status::InvalidArgument("order output missing");
         ++persisted;
         *order = {message.order_id, message.idempotency_key, message.user_id, message.sku_id,
-                  message.quantity, live::business::order::OrderState::kCreated};
+                  message.quantity, live::business::order::OrderState::kPendingPayment};
         return live::common::Status::Ok();
     }
     int persisted{0};
@@ -37,6 +37,10 @@ public:
     live::common::Status persistQueuedOrder(const live::messaging::FlashSaleOrderMessage&,
                                             live::business::order::Order*) override {
         return live::common::Status::Internal("injected MySQL failure");
+    }
+    live::common::Status getOrder(const std::string&,
+                                  live::business::order::Order*) const override {
+        return live::common::Status::NotFound("injected lookup confirms no durable order");
     }
 };
 
@@ -71,12 +75,15 @@ int main() {
 
         live::business::flash_sale::FlashSaleOrderService service(promotion.admissionGate(), &gateway, &queue);
         live::business::flash_sale::FlashSaleSubmitResult result;
-        check(service.submit({"kafka-promo-" + id, "kafka-sku-" + id, "kafka-user-1", "kafka-idem-1", 1}, &result).ok() &&
-              result.code == live::business::flash_sale::SubmitCode::kQueued, "Kafka flash-sale submit");
+        const auto submit_status = service.submit(
+            {"kafka-promo-" + id, "kafka-sku-" + id, "kafka-user-1", "kafka-idem-1", 1}, &result);
+        check(submit_status.ok() && result.code == live::business::flash_sale::SubmitCode::kQueued,
+              submit_status.ok() ? "Kafka flash-sale submit result" : submit_status.message().c_str());
         for (int i = 0; i < 50 && consumer.processed() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         check(consumer.processed() == 1 && repository.persisted == 1, "Kafka flash-sale consume");
         live::business::inventory::StockSnapshot stock;
-        check(inventory.queryStock("kafka-sku-" + id, &stock).ok() && stock.available == 1 && stock.sold == 1,
+        check(inventory.queryStock("kafka-sku-" + id, &stock).ok() && stock.available == 1 &&
+              stock.reserved == 1 && stock.sold == 0,
               "Kafka flash-sale inventory");
         live::business::flash_sale::FlashSaleSubmitResult duplicate;
         check(service.submit({"kafka-promo-" + id, "kafka-sku-" + id, "kafka-user-1", "kafka-idem-2", 1}, &duplicate).ok() &&
@@ -115,7 +122,8 @@ int main() {
         for (int i = 0; i < 60 && poison_consumer.deadLettered() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         check(poison_consumer.deadLettered() == 1, "Kafka DLQ delivery");
         check(dlq_inventory.queryStock(dlq_sku, &stock).ok() && stock.available == 1 && stock.reserved == 0,
-              "Kafka DLQ compensation");
+              ("Kafka DLQ compensation: available=" + std::to_string(stock.available) +
+               " reserved=" + std::to_string(stock.reserved) + " sold=" + std::to_string(stock.sold)).c_str());
         poison_consumer.stop();
         producer.stop();
         std::cout << "kafka_flash_sale_test passed\n";

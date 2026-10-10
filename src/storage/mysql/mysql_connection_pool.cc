@@ -14,6 +14,8 @@ common::Status connectOne(const std::string& host, std::uint16_t port,
     if (connection == nullptr) return common::Status::Internal("mysql_init failed");
     unsigned int timeout = 3;
     mysql_options(connection, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+    bool reconnect = true;
+    mysql_options(connection, MYSQL_OPT_RECONNECT, &reconnect);
     if (mysql_real_connect(connection, host.c_str(), user.c_str(), password.c_str(), database.c_str(),
                            port, nullptr, 0) == nullptr) {
         const std::string message = mysql_error(connection);

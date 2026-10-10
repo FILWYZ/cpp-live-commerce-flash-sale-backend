@@ -49,7 +49,10 @@ bool readField(const std::string& value, std::size_t* offset, std::string* field
 
 common::Status FlashSaleOrderMessage::validate() const {
     if (version != 1 || promotion_id.empty() || order_id.empty() || idempotency_key.empty() ||
-        user_id.empty() || sku_id.empty() || quantity <= 0) {
+        user_id.empty() || sku_id.empty() || quantity <= 0 ||
+        promotion_id.size() > 64 || order_id.size() > 64 || idempotency_key.size() > 128 ||
+        user_id.size() > 64 || sku_id.size() > 64 ||
+        quantity > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
         return common::Status::InvalidArgument("invalid flash-sale order message");
     }
     return common::Status::Ok();

@@ -12,6 +12,7 @@ option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 option(ENABLE_REDIS "Build hiredis Redis adapter when hiredis is installed" ON)
 option(ENABLE_KAFKA "Build librdkafka adapter when librdkafka is installed" ON)
+option(ENABLE_ROCKETMQ "Build Apache RocketMQ 5.x C++ SDK adapter when installed" ON)
 option(ENABLE_MYSQL "Build MySQL transaction repository when mysqlclient is installed" ON)
 option(ENABLE_EXTERNAL_TESTS "Build tests that require running Redis and Kafka" OFF)
 
@@ -43,6 +44,7 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 add_library(ecommerce_security
     src/common/security/password_hasher.cc
+    src/common/security/webhook_signature.cc
 )
 target_include_directories(ecommerce_security PUBLIC src)
 target_link_libraries(ecommerce_security PUBLIC project_options OpenSSL::Crypto)
@@ -90,12 +92,13 @@ add_library(ecommerce_business
     src/business/promotion/flash_sale_gate.cc
     src/business/flash_sale/flash_sale_order_service.cc
     src/business/flash_sale/flash_sale_order_consumer.cc
+    src/business/flash_sale/flash_sale_request_status_store.cc
     src/business/flash_sale/local_flash_sale_order_repository.cc
     src/business/order/order_service.cc
     src/business/user/user_service.cc
 )
 target_include_directories(ecommerce_business PUBLIC src)
-target_link_libraries(ecommerce_business PUBLIC project_options ecommerce_cache ecommerce_messaging ecommerce_storage ecommerce_security)
+target_link_libraries(ecommerce_business PUBLIC project_options ecommerce_cache ecommerce_messaging ecommerce_storage ecommerce_security ecommerce_kv)
 
 if(ENABLE_MYSQL)
     find_path(MYSQL_INCLUDE_DIR mysql/mysql.h
@@ -139,9 +142,11 @@ if(ENABLE_REDIS)
         add_library(ecommerce_redis
             src/kv/redis_kv_store.cc
             src/kv/redis_flash_sale_gate.cc
+            src/kv/redis_flash_sale_waiting_room.cc
             src/kv/redis_inventory_fast_path.cc
             src/kv/redis_inventory_gateway.cc
             src/kv/redis_order_queue.cc)
+        target_sources(ecommerce_redis PRIVATE src/traffic/redis_token_bucket.cc)
         target_include_directories(ecommerce_redis PUBLIC src)
         target_include_directories(ecommerce_redis SYSTEM PUBLIC ${HIREDIS_INCLUDE_DIR})
         target_link_libraries(ecommerce_redis PUBLIC project_options ecommerce_kv ${HIREDIS_LIBRARY})
@@ -187,6 +192,26 @@ if(ENABLE_KAFKA)
     endif()
 endif()
 
+if(ENABLE_ROCKETMQ)
+    find_package(rocketmq CONFIG QUIET)
+    set(ROCKETMQ_SDK_TARGET "")
+    if(TARGET rocketmq::rocketmq_shared)
+        set(ROCKETMQ_SDK_TARGET rocketmq::rocketmq_shared)
+    elseif(TARGET rocketmq)
+        set(ROCKETMQ_SDK_TARGET rocketmq)
+    elseif(TARGET rocketmq_shared)
+        set(ROCKETMQ_SDK_TARGET rocketmq_shared)
+    endif()
+    if(ROCKETMQ_SDK_TARGET)
+        add_library(ecommerce_rocketmq src/messaging/rocketmq_order_queue.cc)
+        target_include_directories(ecommerce_rocketmq PUBLIC src)
+        target_link_libraries(ecommerce_rocketmq PUBLIC project_options ecommerce_messaging ${ROCKETMQ_SDK_TARGET})
+        target_compile_definitions(ecommerce_rocketmq PUBLIC ECOMMERCE_HAS_ROCKETMQ=1)
+    else()
+        message(STATUS "Apache RocketMQ C++ SDK not found; RocketMQ adapter is disabled")
+    endif()
+endif()
+
 add_executable(first_stage_test tests/unit/first_stage_test.cc)
 target_link_libraries(first_stage_test PRIVATE project_options ecommerce_gateway ecommerce_business ecommerce_storage ecommerce_observability)
 add_test(NAME first_stage_test COMMAND first_stage_test)
@@ -223,6 +248,13 @@ if(TARGET ecommerce_kafka)
     target_link_libraries(ecommerce_api_demo PRIVATE ecommerce_kafka)
     target_compile_definitions(ecommerce_api_demo PRIVATE ECOMMERCE_HAS_KAFKA=1)
 endif()
+if(TARGET ecommerce_rocketmq)
+    target_link_libraries(ecommerce_api_demo PRIVATE ecommerce_rocketmq)
+    target_compile_definitions(ecommerce_api_demo PRIVATE ECOMMERCE_HAS_ROCKETMQ=1)
+
+    add_executable(rocketmq_smoke_test tools/rocketmq_smoke_test.cc)
+    target_link_libraries(rocketmq_smoke_test PRIVATE project_options ecommerce_rocketmq)
+endif()
 
 add_executable(http_load_generator tools/http_load_generator.cc)
 target_link_libraries(http_load_generator PRIVATE project_options Threads::Threads)
@@ -238,7 +270,7 @@ target_link_libraries(flash_sale_soak_test PRIVATE project_options ecommerce_bus
 
 if(ENABLE_EXTERNAL_TESTS AND TARGET ecommerce_redis)
     add_executable(redis_concurrency_test tools/redis_concurrency_test.cc)
-    target_link_libraries(redis_concurrency_test PRIVATE project_options ecommerce_redis)
+    target_link_libraries(redis_concurrency_test PRIVATE project_options ecommerce_redis ecommerce_messaging)
     add_test(NAME redis_concurrency_test COMMAND redis_concurrency_test)
 endif()
 

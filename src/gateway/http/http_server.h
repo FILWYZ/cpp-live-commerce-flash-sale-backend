@@ -4,6 +4,7 @@
 #include "common/thread_pool.h"
 #include "gateway/router.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -33,10 +34,12 @@ public:
     void stopInLoop();
     Router& router() { return router_; }
     std::uint16_t port() const;
+    std::size_t activeConnections() const { return active_connections_.load(std::memory_order_relaxed); }
+    std::size_t pendingWorkerRequests() const { return worker_pool_ == nullptr ? 0 : worker_pool_->pending(); }
 
 private:
     struct Connection;
-    void onConnection(int fd);
+    void onConnection(int fd, const std::string& client_ip);
     void removeConnection(int fd);
     void observe(const http::HttpRequest& request, const http::HttpResponse& response, std::int64_t elapsed_us);
 
@@ -47,6 +50,7 @@ private:
     Router router_;
     std::unique_ptr<network::TcpAcceptor> acceptor_;
     std::unordered_map<int, std::shared_ptr<Connection>> connections_;
+    std::atomic<std::size_t> active_connections_{0};
 };
 
 }  // namespace live::gateway::http
