@@ -7,6 +7,9 @@ output/
 compile_commands.json
 *.log
 *.dSYM/
+*.swp
+*.swo
+.DS_Store
 *.profraw
 *.profdata
 coverage/

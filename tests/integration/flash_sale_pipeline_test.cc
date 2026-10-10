@@ -14,6 +14,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -27,12 +28,27 @@ public:
     live::common::Status persistQueuedOrder(const live::messaging::FlashSaleOrderMessage& message,
                                             live::business::order::Order* order) override {
         if (order == nullptr) return live::common::Status::InvalidArgument("order output missing");
-        ++persisted;
+        const auto found = orders.find(message.idempotency_key);
+        if (found != orders.end()) {
+            *order = found->second;
+            return live::common::Status::Ok();
+        }
         *order = {message.order_id, message.idempotency_key, message.user_id, message.sku_id,
                   message.quantity, live::business::order::OrderState::kPendingPayment};
+        orders.emplace(message.idempotency_key, *order);
+        ++persisted;
         return live::common::Status::Ok();
     }
+    live::common::Status getOrder(const std::string& order_id,
+                                  live::business::order::Order* order) const override {
+        for (const auto& [key, value] : orders) {
+            (void)key;
+            if (value.id == order_id) { *order = value; return live::common::Status::Ok(); }
+        }
+        return live::common::Status::NotFound("order not found");
+    }
     std::atomic<int> persisted{0};
+    std::unordered_map<std::string, live::business::order::Order> orders;
 };
 
 class FailingQueue final : public live::messaging::IOrderQueue {
@@ -45,6 +61,29 @@ public:
     }
     std::size_t pending() const override { return accepted.pending(); }
     bool fail{true};
+private:
+    live::messaging::InMemoryOrderQueue accepted;
+};
+
+class AckFailureQueue final : public live::messaging::IOrderQueue {
+public:
+    live::common::Status push(const live::messaging::FlashSaleOrderMessage& message) override {
+        return accepted.push(message);
+    }
+    live::common::Status pop(live::messaging::FlashSaleOrderMessage* message,
+                             std::chrono::milliseconds timeout) override {
+        return accepted.pop(message, timeout);
+    }
+    live::common::Status acknowledge(const live::messaging::FlashSaleOrderMessage& message,
+                                     bool processed) override {
+        if (processed && fail_next_ack.exchange(false)) {
+            (void)accepted.push(message);  // Models RabbitMQ redelivery after commit but before ACK.
+            return live::common::Status::Internal("injected lost ACK");
+        }
+        return live::common::Status::Ok();
+    }
+    std::size_t pending() const override { return accepted.pending(); }
+    std::atomic<bool> fail_next_ack{true};
 private:
     live::messaging::InMemoryOrderQueue accepted;
 };
@@ -229,6 +268,36 @@ int main() {
     check(inventory.queryStock("flash-sku", &stock).ok(), "stock query");
     check(stock.available == 0 && stock.reserved == 100 && stock.sold == 0, "pending-payment inventory reservation");
     check(repository.persisted.load() == 100, "consumer persistence");
+
+    check(inventory.addSku("ack-window-sku", 1).ok(), "ack-window inventory setup");
+    live::business::promotion::PromotionService ack_window_promotion;
+    check(ack_window_promotion.create({"ack-window-campaign", "ack-window-sku", 1}).ok() &&
+          ack_window_promotion.preheat("ack-window-campaign").ok() &&
+          ack_window_promotion.start("ack-window-campaign").ok(), "ack-window campaign setup");
+    AckFailureQueue ack_failure_queue;
+    live::messaging::FlashSaleOrderMessage ack_window_message;
+    ack_window_message.promotion_id = "ack-window-campaign";
+    ack_window_message.order_id = "ack-window-order";
+    ack_window_message.idempotency_key = "ack-window-request";
+    ack_window_message.user_id = "ack-window-user";
+    ack_window_message.sku_id = "ack-window-sku";
+    ack_window_message.quantity = 1;
+    check(ack_failure_queue.push(ack_window_message).ok(), "ack-window message enqueue");
+    const int persisted_before_ack_retry = repository.persisted.load();
+    live::business::flash_sale::FlashSaleOrderConsumer ack_window_consumer(
+        &ack_failure_queue, nullptr, &repository, &inventory_gateway, ack_window_promotion.admissionGate(),
+        5, 1, &request_status);
+    check(!ack_window_consumer.processOnce(std::chrono::milliseconds(10)).ok() &&
+          repository.persisted.load() == persisted_before_ack_retry + 1 && ack_failure_queue.pending() == 1,
+          "order commit survives a lost broker ACK and command is redelivered");
+    check(ack_window_consumer.processOnce(std::chrono::milliseconds(10)).ok() &&
+          repository.persisted.load() == persisted_before_ack_retry + 1 && ack_failure_queue.pending() == 0,
+          "redelivery after commit is idempotent and acknowledged");
+    live::business::inventory::StockSnapshot ack_window_stock;
+    check(inventory.queryStock("ack-window-sku", &ack_window_stock).ok() &&
+          ack_window_stock.available == 0 && ack_window_stock.reserved == 1 && ack_window_stock.sold == 0,
+          "lost ACK redelivery preserves the inventory invariant without a duplicate reservation");
+
     live::messaging::InMemoryOrderQueue rejected_queue;
     live::business::flash_sale::InMemoryFlashSaleRequestStatusStore rejected_status;
     live::messaging::FlashSaleOrderMessage late_rejected_message;
@@ -245,35 +314,8 @@ int main() {
     live::business::flash_sale::FlashSaleOrderConsumer rejected_consumer(
         &rejected_queue, nullptr, &repository, &inventory_gateway, promotion.admissionGate(), 5, 1, &rejected_status);
     check(rejected_consumer.processOnce(std::chrono::milliseconds(10)).ok() && rejected_queue.pending() == 0 &&
-          repository.persisted.load() == 100,
+          repository.persisted.load() == persisted_before_ack_retry + 1,
           "consumer acknowledges a late command without processing a terminal rejected request");
-    check(promotion.create({"waiting-room-campaign", "flash-sku", 1}).ok() &&
-          promotion.preheat("waiting-room-campaign").ok() && promotion.start("waiting-room-campaign").ok(),
-          "waiting-room campaign setup");
-    check(request_status.put({"waiting-room-key", "waiting-room-user", "",
-          live::business::flash_sale::FlashSaleRequestState::kWaiting, "waiting", "waiting-room-campaign"}).ok(),
-          "waiting-room request status setup");
-    live::business::flash_sale::FlashSaleSubmitResult waiting_result;
-    const auto waiting_submit_status = service.submit({"waiting-room-campaign", "flash-sku", "waiting-room-user", "waiting-room-key", 1},
-                         &waiting_result);
-    if (!waiting_submit_status.ok() || waiting_result.code != live::business::flash_sale::SubmitCode::kQueued || queue.pending() != 1) {
-        live::business::promotion::Promotion waiting_campaign;
-        const auto campaign_lookup = promotion.get("waiting-room-campaign", &waiting_campaign);
-        std::cerr << "waiting-room submit diagnostic: status=" << waiting_submit_status.message()
-                  << " code=" << static_cast<int>(waiting_result.code) << " queued=" << queue.pending()
-                  << " message=" << waiting_result.message << " campaign="
-                  << (campaign_lookup.ok() ? live::business::promotion::promotionStateName(waiting_campaign.state) : "missing") << '\n';
-    }
-    check(waiting_submit_status.ok() &&
-          waiting_result.code == live::business::flash_sale::SubmitCode::kQueued && queue.pending() == 1,
-          "waiting-room ticket can be admitted through the normal idempotent order path");
-    live::business::flash_sale::FlashSaleRequestStatus waiting_result_status;
-    check(request_status.get("waiting-room-key", &waiting_result_status).ok() &&
-          waiting_result_status.state == live::business::flash_sale::FlashSaleRequestState::kQueued,
-          "waiting-room ticket changes state only after command-queue acceptance");
-    live::messaging::FlashSaleOrderMessage waiting_queued_message;
-    check(queue.pop(&waiting_queued_message, std::chrono::milliseconds(10)).ok() &&
-          waiting_queued_message.idempotency_key == "waiting-room-key", "waiting-room command payload");
     check(request_status.get(queued_id, &queued_status).ok() &&
           queued_status.state == live::business::flash_sale::FlashSaleRequestState::kPendingPayment,
           "request should advance to pending-payment state");

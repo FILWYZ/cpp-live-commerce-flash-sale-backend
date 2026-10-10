@@ -1,3 +1,3 @@
-# flash-sale benchmark
+# 秒杀性能基准
 
 当前可执行基准验证 10000 个库存预留请求、32 个工作线程下的库存正确性；重点检查成功数、库存余量和 oversell。它不是 10000 个同时在线客户端的网络压测，也不包含 p99/p999；HTTP 接口延迟请使用 `tools/http_load_generator`。

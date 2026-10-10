@@ -1,4 +1,4 @@
-# promotion
+# 活动模块
 
 统一秒杀活动域，支持创建、预热、开始、暂停、恢复、结束、资格判断和查询。活动状态为 `CREATED -> PREHEATING -> RUNNING <-> PAUSED -> FINISHED`，库存操作统一交给 `inventory`。
 

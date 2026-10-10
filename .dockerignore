@@ -1,0 +1,7 @@
+.git
+.gitignore
+build
+build-*
+cmake-build-*
+**/__pycache__
+*.pyc

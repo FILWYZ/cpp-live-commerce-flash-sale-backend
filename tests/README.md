@@ -1,53 +1,33 @@
-# 秒杀后台测试
+# 测试策略
 
-测试围绕一条主链路展开：HTTP 接入、活动准入、库存原子预留、异步队列、消费者、MySQL 事务、Outbox 和恢复补偿。
+测试围绕受支持的交易链路展开：HTTP/Reactor -> 准入 -> 命令队列 -> Redis 库存预留 -> MySQL 订单事务 -> Outbox 与恢复。
 
-关键不变量：库存 `available >= 0`；库存为 100、并发预留 10000 时成功数为 100；同一幂等键最多落一笔订单；重复消息不会重复扣减 MySQL 库存。
-
-## 测试目标
-
-- `first_stage_test`：HTTP 边界、线程唤醒、缓存 Singleflight、用户恢复、Outbox 重试和限流。
-- `storage_recovery_test`：WAL/Snapshot CRC、批量恢复、单写者锁和孤儿库存预占释放。
-- `commerce_concurrency_test`：热点 SKU 并发预占不超卖。
-- `security_outbox_test`：Session Token、注销失效、Outbox 重启恢复和校验。
-- `flash_sale_pipeline_test`：活动闸门、库存预留、异步消费者、入队失败补偿。
-- `mysql_transaction_test`：真实 MySQL 的秒杀订单事务、幂等、库存镜像和 Outbox。
-- Redis/Kafka 外部测试：真实 Redis Lua/List、Kafka 消费者组、重试和 DLQ。
-
-## 执行
+## 本地 CTest 测试集
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_MYSQL=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-外部依赖测试需要先启动 Compose，并配置 `-DENABLE_EXTERNAL_TESTS=ON`。MySQL 测试使用：
+- `first_stage_test`：HTTP 边界、EventLoop 唤醒、缓存、会话、Outbox 和限流。
+- `storage_recovery_test`：本地引擎 WAL/Snapshot 工具及恢复行为。
+- `commerce_concurrency_test`：并发库存预留和防止超卖。
+- `security_outbox_test`：会话行为及 Outbox 重试/重启。
+- `flash_sale_pipeline_test`：准入、异步处理、幂等和补偿。
+- `mysql_transaction_test`：MySQL 订单、库存账本、幂等和 Outbox 事务。
 
-```bash
-ECOMMERCE_MYSQL_TEST_HOST=127.0.0.1 \
-ECOMMERCE_MYSQL_TEST_PORT=13306 \
-ECOMMERCE_MYSQL_TEST_DATABASE=ecommerce \
-./build/mysql_transaction_test
-```
+## 真实依赖测试
 
-可用 Docker daemon、Redis/MySQL/Kafka 客户端开发库时，也可直接运行统一外部验收脚本。脚本会等待 Redis、MySQL 和 Redpanda 健康后，构建外部测试并执行 CTest；依赖容器会保持运行，数据保留在 Compose 持久化卷中：
+运行 [`../deploy/scripts/external_validation.sh`](../deploy/scripts/external_validation.sh)，在隔离的依赖服务上验证 Redis Lua 库存与令牌桶行为、MySQL 事务行为，以及 RabbitMQ 发布确认/持久化投递/手动 ACK 行为。最近一次结果为 CTest 7/7 通过，RabbitMQ 传输冒烟测试通过。
 
-```bash
-./deploy/scripts/external_validation.sh
-```
+运行 `RUN_TSAN=1 ./deploy/scripts/test.sh`，可依次执行常规测试集、ASAN+UBSAN 测试集和 TSAN 测试集。最近一次运行中三个测试集均为 6/6 通过。
 
-RocketMQ SDK/Proxy 的编译与运行验收仍需单独按 `deploy/README.md` 配置；该脚本不宣称覆盖 RocketMQ。
+## 故障场景
 
-长稳样本：
+已执行的 Redis、RabbitMQ、MySQL 和 Outbox 恢复场景记录在 [`../docs/failure_matrix.md`](../docs/failure_matrix.md)。隔离故障脚本通过可选的一次性进程崩溃钩子，验证事务提交前、事务提交后但 ACK 前，以及 Outbox Confirm 后但更新发布标记前的消息重新投递。集成测试还单独模拟 ACK 失败并验证幂等性。每次恢复测试都检查：
 
-```bash
-FLASH_SOAK_SECONDS=30 ./build/flash_sale_soak_test
-```
-
-HTTP 工具分别用于单接口和只读业务路径基准，不等价于生产容量结论：
-
-```bash
-./build/http_load_generator 127.0.0.1 8080 /health 10000 64
-./build/http_business_load_generator 127.0.0.1 8080 10000 64
+```text
+有效订单数 <= 初始库存
+available + reserved + sold = total
 ```

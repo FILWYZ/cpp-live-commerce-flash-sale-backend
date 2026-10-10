@@ -82,11 +82,7 @@ def main():
         "order_id": state.get("order_id"),
         "final_state": state.get("state"),
         "stock": stock,
-        "consumer": {
-            "processed": stats.get("flash_sale_consumer_processed"),
-            "rejected": stats.get("flash_sale_consumer_rejected"),
-            "queue_depth": stats.get("flash_sale_queue_depth"),
-        },
+        "command_queue_depth": stats.get("flash_sale_queue_depth"),
     }, indent=2))
 
 

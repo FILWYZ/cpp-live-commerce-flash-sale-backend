@@ -68,7 +68,6 @@ const char* flashSaleRequestStateName(FlashSaleRequestState state) {
         case FlashSaleRequestState::kPaid: return "PAID";
         case FlashSaleRequestState::kExpired: return "EXPIRED";
         case FlashSaleRequestState::kCancelled: return "CANCELLED";
-        case FlashSaleRequestState::kWaiting: return "WAITING";
         case FlashSaleRequestState::kSubmitting: return "SUBMITTING";
     }
     return "REJECTED";

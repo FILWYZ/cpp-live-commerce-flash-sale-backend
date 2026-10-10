@@ -48,6 +48,9 @@ common::Status RedisKVStore::connect(const std::string& host, std::uint16_t port
         std::lock_guard<std::mutex> lock(mutex_);
         connections_ = connections;
         for (const auto& connection : connections_) idle_.push_back(connection);
+        host_ = host;
+        port_ = port;
+        timeout_ = timeout;
         closing_ = false;
     }
     condition_.notify_all();
@@ -99,11 +102,39 @@ std::shared_ptr<RedisKVStore::Connection> RedisKVStore::acquire(std::chrono::mil
     auto connection = idle_.front();
     idle_.pop_front();
     ++in_use_;
+    const auto host = host_;
+    const auto port = port_;
+    const auto connect_timeout = timeout_;
+    lock.unlock();
+
+    if (connection->context == nullptr || connection->context->err != 0) {
+        if (connection->context != nullptr) redisFree(connection->context);
+        connection->context = nullptr;
+        connection->script_shas.clear();
+        timeval tv{};
+        tv.tv_sec = static_cast<long>(connect_timeout.count() / 1000);
+        tv.tv_usec = static_cast<long>((connect_timeout.count() % 1000) * 1000);
+        connection->context = redisConnectWithTimeout(host.c_str(), port, tv);
+        if (connection->context == nullptr || connection->context->err != 0) {
+            if (connection->context != nullptr) redisFree(connection->context);
+            connection->context = nullptr;
+            lock.lock();
+            --in_use_;
+            idle_.push_back(std::move(connection));
+            condition_.notify_one();
+            return {};
+        }
+    }
     return connection;
 }
 
 void RedisKVStore::release(std::shared_ptr<Connection> connection) {
     if (connection == nullptr) return;
+    if (connection->context != nullptr && connection->context->err != 0) {
+        redisFree(connection->context);
+        connection->context = nullptr;
+        connection->script_shas.clear();
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (in_use_ > 0) --in_use_;
     if (!closing_) idle_.push_back(std::move(connection));

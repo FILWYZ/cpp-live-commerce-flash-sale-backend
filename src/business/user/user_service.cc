@@ -137,7 +137,12 @@ common::Status UserService::authenticate(const std::string& token, User* user) c
     std::string user_id;
     if (session_store_ != nullptr) {
         const auto status = session_store_->get("session:" + token, &user_id);
-        if (!status.ok()) return common::Status::Unauthenticated("invalid or expired session");
+        if (!status.ok()) {
+            if (status.code() == common::ErrorCode::kNotFound) {
+                return common::Status::Unauthenticated("invalid or expired session");
+            }
+            return status;
+        }
     } else {
         const auto token_it = user_id_by_token_.find(token);
         if (token_it == user_id_by_token_.end()) return common::Status::Unauthenticated("invalid session");
@@ -153,8 +158,9 @@ common::Status UserService::authenticate(const std::string& token, User* user) c
     if (user_it == users_by_id_.end() && session_store_ != nullptr) {
         std::string shared_value;
         User shared_user;
-        if (session_store_->get("user:" + user_id, &shared_value).ok() && deserialize(shared_value, &shared_user) &&
-            shared_user.id == user_id) {
+        const auto shared_status = session_store_->get("user:" + user_id, &shared_value);
+        if (!shared_status.ok() && shared_status.code() != common::ErrorCode::kNotFound) return shared_status;
+        if (shared_status.ok() && deserialize(shared_value, &shared_user) && shared_user.id == user_id) {
             users_by_id_[shared_user.id] = shared_user;
             id_by_username_[shared_user.username] = shared_user.id;
             user_it = users_by_id_.find(user_id);

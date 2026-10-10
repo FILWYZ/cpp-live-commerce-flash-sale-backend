@@ -1,4 +1,4 @@
-# network
+# 网络模块
 
 从现有 Mymoduo Reactor 网络库演进，负责 Linux 高性能网络基础设施：`EventLoop`、`Channel`、`epoll`、`Buffer`、`eventfd`、`timerfd`、线程模型和对象生命周期。
 

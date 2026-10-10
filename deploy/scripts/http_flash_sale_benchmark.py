@@ -156,7 +156,8 @@ def main():
     business_rejections = status_counts.get(409, 0)
     initial_stock = int(os.environ.get("ECOMMERCE_DEMO_STOCK", "100"))
     stock_invariant = stock.get("available", -1) + stock.get("reserved", -1) + stock.get("sold", -1) == initial_stock
-    dead_lettered = stats.get("flash_sale_consumer_dead_lettered", 0)
+    # /debug/stats is process-local; API counters do not aggregate the separate consumer.
+    # Per-request terminal states verify settlement, but DLQ depth needs broker-level inspection.
 
     report = {
         "run_id": run_id,
@@ -165,15 +166,16 @@ def main():
             "processor": platform.processor() or "unknown",
             "logical_cpu_count": os.cpu_count(),
             "python_version": platform.python_version(),
-            "container_images": {
-                "gateway": "locally built Docker image",
-                "redis": "redis:7-alpine",
-                "mysql": "mysql:8.4",
-                "redpanda": "redpandadata/redpanda:v24.1.2",
-                "rocketmq": "apache/rocketmq:5.3.2 (single broker; RocketMQ mode only)",
+            "external_service_images": {
+                key: value for key, value in {
+                    "rabbitmq": os.environ.get("ECOMMERCE_RABBITMQ_IMAGE"),
+                    "redis": os.environ.get("ECOMMERCE_REDIS_IMAGE"),
+                    "mysql": os.environ.get("ECOMMERCE_MYSQL_IMAGE"),
+                }.items() if value
             },
         },
-        "mode": os.environ.get("ECOMMERCE_FLASH_SALE_QUEUE", "redis"),
+        "queue_mode": os.environ.get("ECOMMERCE_FLASH_SALE_QUEUE", "unspecified"),
+        "inventory_mode": os.environ.get("ECOMMERCE_INVENTORY_MODE", "unspecified"),
         "compose_project": os.environ.get("ECOMMERCE_BENCH_PROJECT", "unspecified"),
         "application_configuration": {
             "gateway_workers": int(os.environ.get("ECOMMERCE_HTTP_WORKERS", "8")),
@@ -207,13 +209,15 @@ def main():
         "terminal_request_states": dict(terminal_states),
         "stock": stock,
         "stock_invariant_available_plus_reserved_plus_sold_equals_initial": stock_invariant,
-        "consumer_stats": stats,
-        "dead_lettered_commands": dead_lettered,
-        "rocketmq_broker_dlq_retry_and_replay": "not verified by this load run",
+        "api_process_local_stats": stats,
+        "consumer_metrics_scope": "api process only; not an aggregate of order_consumer",
+        "dead_lettered_commands": None,
+        "dead_lettered_commands_note": "not measured by this benchmark; accepted request settlement is checked separately",
+        "rabbitmq_dlq_retry_and_replay": "not verified by this load run",
         "http_responses_observed": response_count,
     }
     print(json.dumps(report, indent=2, sort_keys=True))
-    if transport_errors or server_errors or dead_lettered or unsettled or not stock_invariant or not accepted or sum(terminal_states.values()) != len(accepted):
+    if transport_errors or server_errors or unsettled or not stock_invariant or not accepted or sum(terminal_states.values()) != len(accepted):
         raise SystemExit(1)
 
 

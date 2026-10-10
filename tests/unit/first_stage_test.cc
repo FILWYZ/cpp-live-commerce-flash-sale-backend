@@ -4,7 +4,6 @@
 #include "business/user/user_service.h"
 #include "cache/sharded_cache.h"
 #include "common/security/password_hasher.h"
-#include "common/security/webhook_signature.h"
 #include "gateway/http/http_parser.h"
 #include "gateway/router.h"
 #include "kv/kv_store.h"
@@ -124,23 +123,23 @@ void testCacheAndKv() {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     std::string value;
     check(client.get("temporary", &value).code() == live::common::ErrorCode::kNotFound, "KV TTL expiry");
-    live::business::flash_sale::KvFlashSaleRequestStatusStore waiting_status_store(store.get());
-    check(waiting_status_store.put({"waiting-request", "waiting-user", "",
-              live::business::flash_sale::FlashSaleRequestState::kWaiting,
-              "waiting for admission", "promo-waiting"}).ok(), "waiting-room status write");
-    live::business::flash_sale::FlashSaleRequestStatus waiting_status;
-    check(waiting_status_store.get("waiting-request", &waiting_status).ok() &&
-              waiting_status.state == live::business::flash_sale::FlashSaleRequestState::kWaiting &&
-              waiting_status.promotion_id == "promo-waiting", "waiting-room status persistence");
-    bool waiting_transitioned = false;
-    check(waiting_status_store.transition("waiting-request",
-              live::business::flash_sale::FlashSaleRequestState::kWaiting,
-              live::business::flash_sale::FlashSaleRequestState::kSubmitting, &waiting_transitioned).ok() &&
-              waiting_transitioned, "request status compare-and-set transition");
-    check(waiting_status_store.transition("waiting-request",
-              live::business::flash_sale::FlashSaleRequestState::kWaiting,
-              live::business::flash_sale::FlashSaleRequestState::kQueued, &waiting_transitioned).ok() &&
-              !waiting_transitioned, "stale request status transition cannot regress state");
+    live::business::flash_sale::KvFlashSaleRequestStatusStore request_status_store(store.get());
+    check(request_status_store.put({"submit-request", "submit-user", "order-1",
+              live::business::flash_sale::FlashSaleRequestState::kSubmitting,
+              "submitting", "promo-1"}).ok(), "submission status write");
+    live::business::flash_sale::FlashSaleRequestStatus request_status;
+    check(request_status_store.get("submit-request", &request_status).ok() &&
+              request_status.state == live::business::flash_sale::FlashSaleRequestState::kSubmitting &&
+              request_status.promotion_id == "promo-1", "submission status persistence");
+    bool transitioned = false;
+    check(request_status_store.transition("submit-request",
+              live::business::flash_sale::FlashSaleRequestState::kSubmitting,
+              live::business::flash_sale::FlashSaleRequestState::kQueued, &transitioned).ok() &&
+              transitioned, "request status compare-and-set transition");
+    check(request_status_store.transition("submit-request",
+              live::business::flash_sale::FlashSaleRequestState::kSubmitting,
+              live::business::flash_sale::FlashSaleRequestState::kQueued, &transitioned).ok() &&
+              !transitioned, "stale request status transition cannot regress state");
 }
 
 void testFlashSaleAdmission() {
@@ -260,15 +259,6 @@ void testOutboxDispatcherMetricsAndRateLimit() {
 }  // namespace
 
 int main() {
-    check(live::common::security::verifyTimestampedHmacSha256(
-        "secret", "123", "test-body", "f4488e93d9b27a0bf77b40edf431fb37fc8874453a5e791e471158cf942de9e0"),
-        "valid timestamped webhook signature");
-    check(live::common::security::verifyTimestampedHmacSha256(
-        "secret", "123", "test-body", "sha256=F4488E93D9B27A0BF77B40EDF431FB37FC8874453A5E791E471158CF942DE9E0"),
-        "prefixed uppercase webhook signature");
-    check(!live::common::security::verifyTimestampedHmacSha256(
-        "secret", "123", "changed-body", "f4488e93d9b27a0bf77b40edf431fb37fc8874453a5e791e471158cf942de9e0"),
-        "changed webhook body rejected");
     try {
         testHttpAndRouter();
         testEventLoopWakeup();

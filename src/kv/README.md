@@ -1,14 +1,7 @@
-# kv
+# 键值存储模块
 
-统一 KV 访问抽象，隔离业务与具体 KV 后端。
+统一 KV 访问抽象，隔离业务与具体 KV 后端。当前生产业务路径使用 Redis 保存短期状态、共享 Token Bucket 限流和秒杀库存预留；MySQL 保留订单、库存账本与请求终态等持久化事实。
 
-## 当前接口
+Redis Lua 在单次脚本内原子执行限流和库存预留/释放。Redis 与 MySQL 不构成分布式事务：提交失败必须通过幂等重试、补偿和 reconciler 对账收敛。Redis 不承载消息队列或 Waiting Room。
 
-已实现 `IKVStore`、`KVClient` 及以下操作：`Get`、`Set`、`Del`、`CAS`、`Expire`。业务幂等语义由业务层显式传入。
-
-## 后端演进
-
-1. Redis 适配器：已使用 hiredis 实现 Get/Set/Del/CAS/Expire、超时连接和 Lua 原子 CAS；`evalInteger` 使用 `SCRIPT LOAD + EVALSHA`，并处理 `NOSCRIPT` 重载。
-2. 秒杀闸门：`RedisFlashSaleGate` 通过 Lua 原子维护活动状态、配额、跨进程用户幂等和回滚；Key 使用 promotion hash tag，便于 Redis Cluster 同槽执行。
-3. 自研 KV 适配器：接入 `storage` 的 Memory KV、WAL、Snapshot。
-4. 本地恢复路径：通过 `storage` 的 Memory KV、WAL 和 Snapshot 提供零依赖运行与重启恢复。
+`IKVStore`、`KVClient` 和本地 Memory KV/WAL/Snapshot 代码仍用于抽象与恢复练习；本地存储不是交易订单的持久化主库。

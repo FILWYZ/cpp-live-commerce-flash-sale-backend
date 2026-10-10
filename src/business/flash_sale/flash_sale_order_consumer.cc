@@ -1,5 +1,6 @@
 #include "business/flash_sale/flash_sale_order_consumer.h"
 
+#include "common/testing/fault_injection.h"
 #include "business/order/order_service.h"
 
 #include <iostream>
@@ -40,6 +41,7 @@ common::Status FlashSaleOrderConsumer::process(const ::live::messaging::FlashSal
         reservation.decision != ::live::business::inventory::InventoryDecision::kDuplicate) {
         return common::Status::Internal("inventory reservation failed");
     }
+    ::live::common::testing::crashOnceAt("after_reservation_before_commit");
     ::live::business::order::Order order;
     if (const auto status = repository_->persistQueuedOrder(message, &order); !status.ok()) return status;
     if (request_status_ != nullptr) {
@@ -80,7 +82,10 @@ common::Status FlashSaleOrderConsumer::processOnce(std::chrono::milliseconds tim
     common::Status last_status = common::Status::Internal("order consumer failed");
     for (std::size_t attempt = 1; attempt <= max_attempts_; ++attempt) {
         last_status = process(message);
-        if (last_status.ok()) return queue_->acknowledge(message, true);
+        if (last_status.ok()) {
+            ::live::common::testing::crashOnceAt("after_commit_before_ack");
+            return queue_->acknowledge(message, true);
+        }
         if (attempt < max_attempts_) std::this_thread::yield();
     }
     std::clog << "flash-sale command exhausted local retries: order_id=" << message.order_id
@@ -126,7 +131,7 @@ common::Status FlashSaleOrderConsumer::start() {
 void FlashSaleOrderConsumer::run() {
     while (running_.load()) {
         const auto status = processOnce(std::chrono::milliseconds(250));
-        if (!status.ok() && !status.isIncomplete()) std::this_thread::yield();
+        if (!status.ok() && !status.isIncomplete()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 

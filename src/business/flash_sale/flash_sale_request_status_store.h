@@ -11,7 +11,7 @@ namespace live::kv { class IKVStore; }
 
 namespace live::business::flash_sale {
 
-enum class FlashSaleRequestState { kQueued, kProcessing, kSoldOut, kRejected, kPendingPayment, kPaid, kExpired, kCancelled, kWaiting, kSubmitting };
+enum class FlashSaleRequestState { kQueued, kProcessing, kSoldOut, kRejected, kPendingPayment, kPaid, kExpired, kCancelled, kSubmitting };
 
 struct FlashSaleRequestStatus {
     std::string request_id;

@@ -1,0 +1,71 @@
+{
+  "accepted_202": 1000,
+  "accepted_admission_rps": 245.29,
+  "accepted_requests_not_settled": 0,
+  "accepted_requests_reached_terminal_state": 1000,
+  "api_process_local_stats": {
+    "flash_sale_consumer_dead_lettered": 0,
+    "flash_sale_consumer_processed": 0,
+    "flash_sale_consumer_rejected": 0,
+    "flash_sale_queue_depth": 0,
+    "http_active_connections": 2,
+    "http_requests": 4069,
+    "http_worker_queue_depth": 0
+  },
+  "application_configuration": {
+    "campaign_limit": 1000,
+    "consumer_workers": 4,
+    "gateway_workers": 8,
+    "initial_stock": 1000,
+    "mysql_pool_size": 16
+  },
+  "business_rejected_409": 0,
+  "compose_project": "codex-rabbitmq-perf-release-20261010",
+  "concurrency": 300,
+  "consumer_metrics_scope": "api process only; not an aggregate of order_consumer",
+  "dead_lettered_commands": null,
+  "dead_lettered_commands_note": "not measured by this benchmark; accepted request settlement is checked separately",
+  "environment": {
+    "external_service_images": {
+      "mysql": "mysql:8.4",
+      "rabbitmq": "rabbitmq:3.13-management-alpine",
+      "redis": "redis:7-alpine"
+    },
+    "logical_cpu_count": 10,
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "python_version": "3.14.5"
+  },
+  "http_responses_observed": 1000,
+  "http_status_counts": {
+    "202": 1000
+  },
+  "inventory_mode": "redis",
+  "latency_ms": {
+    "max": 1146.701,
+    "measured_operation": "authenticated HTTP admission and command publish; setup and order drain excluded",
+    "p50": 1050.245,
+    "p95": 1109.768,
+    "p99": 1127.305
+  },
+  "measured_seconds": 4.077,
+  "queue_mode": "rabbitmq",
+  "rabbitmq_dlq_retry_and_replay": "not verified by this load run",
+  "requests": 1000,
+  "run_id": "c95e3649e4f548bd",
+  "server_error_rate": 0.0,
+  "session_setup_seconds_excluded": 252.397,
+  "stock": {
+    "available": 0,
+    "reserved": 1000,
+    "sold": 0
+  },
+  "stock_invariant_available_plus_reserved_plus_sold_equals_initial": true,
+  "target_submission_rate_rps": null,
+  "terminal_request_states": {
+    "PENDING_PAYMENT": 1000
+  },
+  "throttled_429": 0,
+  "throughput_rps": 245.29,
+  "transport_error_rate": 0.0
+}

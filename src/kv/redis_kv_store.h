@@ -72,6 +72,9 @@ private:
     std::condition_variable condition_;
     std::vector<std::shared_ptr<Connection>> connections_;
     std::deque<std::shared_ptr<Connection>> idle_;
+    std::string host_;
+    std::uint16_t port_{0};
+    std::chrono::milliseconds timeout_{std::chrono::seconds(2)};
     std::size_t in_use_{0};
     bool closing_{true};
 };

@@ -8,8 +8,8 @@
 #include "business/flash_sale/flash_sale_order_consumer.h"
 #include "business/flash_sale/local_flash_sale_order_repository.h"
 #include "business/user/user_service.h"
-#include "common/security/webhook_signature.h"
 #include "cache/sharded_cache.h"
+#include "common/testing/fault_injection.h"
 #include "gateway/http/http_server.h"
 #include "messaging/async_outbox_dispatcher.h"
 #include "messaging/in_memory_broker.h"
@@ -24,17 +24,11 @@
 #ifdef ECOMMERCE_HAS_REDIS
 #include "kv/redis_kv_store.h"
 #include "kv/redis_flash_sale_gate.h"
-#include "kv/redis_flash_sale_waiting_room.h"
 #include "kv/redis_inventory_gateway.h"
-#include "kv/redis_order_queue.h"
 #include "traffic/redis_token_bucket.h"
 #endif
-#ifdef ECOMMERCE_HAS_KAFKA
-#include "messaging/kafka_client.h"
-#include "messaging/kafka_dlq_operator.h"
-#endif
-#ifdef ECOMMERCE_HAS_ROCKETMQ
-#include "messaging/rocketmq_order_queue.h"
+#ifdef ECOMMERCE_HAS_RABBITMQ
+#include "messaging/rabbitmq_order_queue.h"
 #endif
 #ifdef ECOMMERCE_HAS_MYSQL
 #include "storage/mysql/mysql_transaction_store.h"
@@ -295,7 +289,10 @@ live::common::Status authenticateRequest(const live::gateway::http::HttpRequest&
 }
 
 live::gateway::http::HttpResponse unauthorizedResponse(const live::common::Status& status) {
-    return jsonResponse(401, "Unauthorized", "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
+    if (status.code() == live::common::ErrorCode::kUnauthenticated || status.code() == live::common::ErrorCode::kNotFound) {
+        return jsonResponse(401, "Unauthorized", "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
+    }
+    return jsonResponse(503, "Service Unavailable", "{\"error\":\"authentication dependency unavailable\"}");
 }
 
 live::gateway::http::HttpResponse forbiddenResponse(const std::string& message) {
@@ -304,7 +301,7 @@ live::gateway::http::HttpResponse forbiddenResponse(const std::string& message) 
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int runEcommerceApplication(int argc, char** argv) {
     std::signal(SIGINT, requestShutdown);
     std::signal(SIGTERM, requestShutdown);
 #ifdef SIGPIPE
@@ -314,12 +311,14 @@ int main(int argc, char** argv) {
     if (argc > 1) port = static_cast<std::uint16_t>(std::strtoul(argv[1], nullptr, 10));
     const char* configured_process_role = std::getenv("ECOMMERCE_PROCESS_ROLE");
     const std::string process_role = configured_process_role == nullptr ? "all" : configured_process_role;
-    if (process_role != "all" && process_role != "gateway" && process_role != "worker") {
-        std::cerr << "ECOMMERCE_PROCESS_ROLE must be all, gateway or worker\n";
+    if (process_role != "all" && process_role != "api_server" && process_role != "order_consumer" &&
+        process_role != "reconciler" && process_role != "gateway" && process_role != "worker") {
+        std::cerr << "ECOMMERCE_PROCESS_ROLE must be api_server, order_consumer or reconciler\n";
         return 1;
     }
-    const bool run_gateway = process_role != "worker";
-    const bool run_background_workers = process_role != "gateway";
+    const bool run_gateway = process_role == "all" || process_role == "api_server" || process_role == "gateway";
+    const bool run_order_consumer = process_role == "all" || process_role == "order_consumer" || process_role == "worker";
+    const bool run_reconciler = process_role == "all" || process_role == "reconciler" || process_role == "worker";
     const auto demo_stock = static_cast<std::int64_t>(envSize("ECOMMERCE_DEMO_STOCK", 100, 1000000000));
     const auto demo_campaign_limit = envSize("ECOMMERCE_DEMO_CAMPAIGN_LIMIT", 100, 1000000000);
 
@@ -376,18 +375,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     live::messaging::InMemoryBroker broker;
-#ifdef ECOMMERCE_HAS_KAFKA
-    std::unique_ptr<live::messaging::KafkaProducer> kafka;
-    const char* kafka_brokers = std::getenv("ECOMMERCE_KAFKA_BROKERS");
-    if (kafka_brokers != nullptr && *kafka_brokers != '\0') {
-        kafka = std::make_unique<live::messaging::KafkaProducer>();
-        const auto kafka_status = kafka->start(kafka_brokers, "ecommerce-api");
-        if (!kafka_status.ok()) {
-            std::cerr << "Kafka configured but unavailable: " << kafka_status.message() << '\n';
-            return 1;
-        }
-    }
-#endif
 #ifdef ECOMMERCE_HAS_MYSQL
     std::unique_ptr<live::storage::mysql::MySqlTransactionStore> mysql_store;
     const char* mysql_host = std::getenv("ECOMMERCE_MYSQL_HOST");
@@ -499,10 +486,6 @@ int main(int argc, char** argv) {
     const double flash_sale_campaign_burst = envDouble("ECOMMERCE_FLASH_SALE_CAMPAIGN_BURST", 2000.0, 1000000000.0);
     const double flash_sale_ip_rate = envDouble("ECOMMERCE_FLASH_SALE_IP_RATE_PER_SECOND", 200.0, 1000000000.0);
     const double flash_sale_ip_burst = envDouble("ECOMMERCE_FLASH_SALE_IP_BURST", 500.0, 1000000000.0);
-    const std::size_t flash_sale_waiting_capacity = envSize("ECOMMERCE_FLASH_SALE_WAITING_CAPACITY", 100000, 10000000);
-    const char* waiting_room_flag = std::getenv("ECOMMERCE_FLASH_SALE_WAITING_ROOM");
-    const bool waiting_room_enabled = waiting_room_flag == nullptr ||
-        (std::string_view(waiting_room_flag) != "0" && std::string_view(waiting_room_flag) != "false");
 #ifndef ECOMMERCE_HAS_REDIS
     (void)flash_sale_user_rate;
     (void)flash_sale_user_burst;
@@ -510,8 +493,6 @@ int main(int argc, char** argv) {
     (void)flash_sale_campaign_burst;
     (void)flash_sale_ip_rate;
     (void)flash_sale_ip_burst;
-    (void)flash_sale_waiting_capacity;
-    (void)waiting_room_enabled;
 #endif
     const auto trusted_proxy_ips = splitCsv(std::getenv("ECOMMERCE_TRUSTED_PROXY_IPS"));
     live::traffic::TokenBucket flash_sale_limiter(flash_sale_rate, flash_sale_burst);
@@ -566,23 +547,22 @@ int main(int argc, char** argv) {
     std::unique_ptr<live::business::inventory::IInventoryGateway> flash_inventory_gateway;
     std::unique_ptr<live::messaging::IOrderQueue> flash_order_queue;
     std::unique_ptr<live::messaging::IOrderQueue> flash_dead_letter_queue;
-#ifdef ECOMMERCE_HAS_ROCKETMQ
-    live::messaging::RocketMqOrderQueue* rocketmq_publisher = nullptr;
+#ifdef ECOMMERCE_HAS_RABBITMQ
+    live::messaging::RabbitMqOrderQueue* rabbitmq_publisher = nullptr;
 #endif
     const char* configured_flash_queue = std::getenv("ECOMMERCE_FLASH_SALE_QUEUE");
     const std::size_t flash_consumer_workers = envSize("ECOMMERCE_FLASH_CONSUMER_WORKERS", 4, 64);
     const std::string flash_queue_mode = configured_flash_queue == nullptr
-        ? (use_redis_flash_sale ? "redis" : "local")
+        ? "local"
         : configured_flash_queue;
-    const bool use_redis_flash_queue = flash_queue_mode == "redis";
     std::size_t effective_flash_consumer_workers = flash_consumer_workers;
-    if (flash_queue_mode != "redis" && flash_queue_mode != "local" && flash_queue_mode != "rocketmq") {
-        std::cerr << "ECOMMERCE_FLASH_SALE_QUEUE must be redis, rocketmq or local\n";
+    if (flash_queue_mode != "local" && flash_queue_mode != "rabbitmq") {
+        std::cerr << "ECOMMERCE_FLASH_SALE_QUEUE must be rabbitmq or local\n";
         return 1;
     }
     if (process_role != "all") {
         if (flash_queue_mode == "local") {
-            std::cerr << "split gateway/worker roles require a shared Redis or RocketMQ command queue\n";
+            std::cerr << "split process roles require the RabbitMQ command queue\n";
             return 1;
         }
 #ifndef ECOMMERCE_HAS_REDIS
@@ -604,10 +584,15 @@ int main(int argc, char** argv) {
 #endif
 #endif
     }
-    if (flash_queue_mode == "rocketmq") {
-        effective_flash_consumer_workers = 1;  // SimpleConsumer polling is serialized per client instance.
-#ifndef ECOMMERCE_HAS_ROCKETMQ
-        std::cerr << "ECOMMERCE_FLASH_SALE_QUEUE=rocketmq requires the Apache RocketMQ C++ SDK at build time\n";
+    if (flash_queue_mode == "rabbitmq") {
+        const char* host = std::getenv("ECOMMERCE_RABBITMQ_HOST");
+        if (host == nullptr || *host == '\0') {
+            std::cerr << "ECOMMERCE_FLASH_SALE_QUEUE=rabbitmq requires ECOMMERCE_RABBITMQ_HOST\n";
+            return 1;
+        }
+        effective_flash_consumer_workers = std::min<std::size_t>(effective_flash_consumer_workers, 16);
+#ifndef ECOMMERCE_HAS_RABBITMQ
+        std::cerr << "ECOMMERCE_FLASH_SALE_QUEUE=rabbitmq requires rabbitmq-c at build time\n";
         return 1;
 #endif
     }
@@ -626,56 +611,41 @@ int main(int argc, char** argv) {
     } else {
         flash_inventory_gateway = std::make_unique<live::business::inventory::LocalInventoryGateway>(&inventory);
     }
-    if (use_redis_flash_queue) {
-#ifdef ECOMMERCE_HAS_REDIS
-        if (!use_redis_flash_sale || redis == nullptr) {
-            std::cerr << "Redis queue requires Redis inventory mode and connection\n";
+if (flash_queue_mode == "rabbitmq") {
+#ifdef ECOMMERCE_HAS_RABBITMQ
+        const auto host = std::getenv("ECOMMERCE_RABBITMQ_HOST");
+        const auto username = std::getenv("ECOMMERCE_RABBITMQ_USER");
+        const auto password = std::getenv("ECOMMERCE_RABBITMQ_PASSWORD");
+        const auto vhost = std::getenv("ECOMMERCE_RABBITMQ_VHOST");
+        const auto exchange = std::getenv("ECOMMERCE_RABBITMQ_EXCHANGE");
+        const auto command_queue = std::getenv("ECOMMERCE_RABBITMQ_COMMAND_QUEUE");
+        const std::string resolved_exchange = exchange == nullptr ? "flashsale.direct" : exchange;
+        const std::string resolved_queue = command_queue == nullptr ? "flashsale.command.queue" : command_queue;
+        auto rabbitmq_queue = std::make_unique<live::messaging::RabbitMqOrderQueue>();
+        const auto start_status = rabbitmq_queue->start(host,
+            static_cast<int>(envSize("ECOMMERCE_RABBITMQ_PORT", 5672, 65535)),
+            username == nullptr ? "guest" : username, password == nullptr ? "guest" : password,
+            vhost == nullptr ? "/" : vhost, resolved_exchange, resolved_queue, "flashsale.command",
+            run_order_consumer);
+        if (!start_status.ok()) {
+            std::cerr << "failed to start RabbitMQ command transport: " << start_status.message() << '\n';
             return 1;
         }
-        auto redis_order_queue = std::make_unique<live::kv::RedisOrderQueue>(redis.get(), "flash_orders:{promo-1}");
-        if (run_background_workers) {
-            if (const auto status = redis_order_queue->connectBlockingConsumer(
-                    redis_host, 6379, std::chrono::seconds(2), effective_flash_consumer_workers); !status.ok()) {
-                std::cerr << "failed to create dedicated Redis queue consumer connection: " << status.message() << '\n';
-                return 1;
-            }
-        }
-        flash_order_queue = std::move(redis_order_queue);
-        flash_dead_letter_queue = std::make_unique<live::kv::RedisOrderQueue>(redis.get(), "flash_orders_dlq:{promo-1}");
- #else
-        std::cerr << "Redis queue requires the hiredis adapter at build time\n";
-        return 1;
- #endif
-    } else if (flash_queue_mode == "rocketmq") {
-#ifdef ECOMMERCE_HAS_ROCKETMQ
-        const char* endpoint = std::getenv("ECOMMERCE_ROCKETMQ_ENDPOINT");
-        const char* command_topic = std::getenv("ECOMMERCE_ROCKETMQ_COMMAND_TOPIC");
-        const char* consumer_group = std::getenv("ECOMMERCE_ROCKETMQ_CONSUMER_GROUP");
-        auto rocketmq_queue = std::make_unique<live::messaging::RocketMqOrderQueue>();
-        const auto status = rocketmq_queue->start(endpoint == nullptr ? "" : endpoint,
-            command_topic == nullptr ? "flashsale.command" : command_topic,
-            consumer_group == nullptr ? "flashsale-command-consumers" : consumer_group,
-            run_background_workers, run_gateway);
-        if (!status.ok()) {
-            std::cerr << "failed to start RocketMQ command transport: " << status.message() << '\n';
-            return 1;
-        }
-        rocketmq_publisher = rocketmq_queue.get();
-        flash_order_queue = std::move(rocketmq_queue);
-        auto rocketmq_dead_letter_queue = std::make_unique<live::messaging::RocketMqOrderQueue>();
-        const char* dlq_topic = std::getenv("ECOMMERCE_ROCKETMQ_DLQ_TOPIC");
-        const std::string resolved_dlq_topic = dlq_topic == nullptr || *dlq_topic == '\0'
-            ? std::string(command_topic == nullptr ? "flashsale.command" : command_topic) + ".dlq"
-            : dlq_topic;
-        const std::string dlq_group = std::string(consumer_group == nullptr
-            ? "flashsale-command-consumers" : consumer_group) + "-app-dlq-writer";
-        const auto dlq_status = rocketmq_dead_letter_queue->start(endpoint == nullptr ? "" : endpoint,
-            resolved_dlq_topic, dlq_group, false, false);
+        rabbitmq_publisher = rabbitmq_queue.get();
+        flash_order_queue = std::move(rabbitmq_queue);
+        const auto dlq_name = std::getenv("ECOMMERCE_RABBITMQ_DLQ_QUEUE");
+        auto rabbitmq_dlq = std::make_unique<live::messaging::RabbitMqOrderQueue>();
+        const auto dlq_status = rabbitmq_dlq->start(host,
+            static_cast<int>(envSize("ECOMMERCE_RABBITMQ_PORT", 5672, 65535)),
+            username == nullptr ? "guest" : username, password == nullptr ? "guest" : password,
+            vhost == nullptr ? "/" : vhost, resolved_exchange,
+            dlq_name == nullptr ? "flashsale.command.dlq" : dlq_name,
+            "flashsale.command.dlq", run_gateway);
         if (!dlq_status.ok()) {
-            std::cerr << "failed to start RocketMQ application DLQ producer: " << dlq_status.message() << '\n';
+            std::cerr << "failed to start RabbitMQ DLQ publisher: " << dlq_status.message() << '\n';
             return 1;
         }
-        flash_dead_letter_queue = std::move(rocketmq_dead_letter_queue);
+        flash_dead_letter_queue = std::move(rabbitmq_dlq);
 #endif
     } else {
         flash_order_queue = std::make_unique<live::messaging::InMemoryOrderQueue>();
@@ -726,154 +696,17 @@ int main(int argc, char** argv) {
     flash_consumer = std::make_unique<live::business::flash_sale::FlashSaleOrderConsumer>(
         flash_order_queue.get(), flash_dead_letter_queue.get(), flash_repo, flash_inventory_gateway.get(),
         promotions.admissionGate(), 5, effective_flash_consumer_workers, flash_request_status_store);
-    if (run_background_workers && !flash_consumer->start().ok()) {
+    if (run_order_consumer && !flash_consumer->start().ok()) {
         std::cerr << "failed to start flash-sale consumer\n";
         return 1;
     }
     auto flash_order_service = std::make_unique<live::business::flash_sale::FlashSaleOrderService>(
         promotions.admissionGate(), flash_order_queue.get(), flash_ingress_status_store, &promotions);
 
-    std::atomic<bool> waiting_room_stop{false};
-    std::vector<std::thread> waiting_room_workers;
-#ifdef ECOMMERCE_HAS_REDIS
-    if (run_background_workers && redis != nullptr && waiting_room_enabled && flash_queue_mode != "local") {
-        const auto worker_count = envSize("ECOMMERCE_FLASH_SALE_WAITING_WORKERS", 4, 64);
-        waiting_room_workers.reserve(worker_count);
-        const auto worker_epoch = std::chrono::steady_clock::now().time_since_epoch().count();
-        for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
-            waiting_room_workers.emplace_back([&, worker_index] {
-                const std::string lease_owner = "waiting-" + std::to_string(worker_epoch) + "-" + std::to_string(worker_index);
-                std::vector<live::business::promotion::Promotion> campaigns;
-                auto next_campaign_refresh = std::chrono::steady_clock::time_point::min();
-                while (!waiting_room_stop.load(std::memory_order_relaxed)) {
-                    const auto now = std::chrono::steady_clock::now();
-                    if (now >= next_campaign_refresh) {
-                        const auto list_status = promotions.list(&campaigns);
-                        next_campaign_refresh = now + std::chrono::seconds(2);
-                        if (!list_status.ok()) {
-                            std::clog << "waiting-room campaign scan failed: " << list_status.message() << '\n';
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                            continue;
-                        }
-                    }
-                    bool made_progress = false;
-                    for (const auto& campaign : campaigns) {
-                        if (waiting_room_stop.load(std::memory_order_relaxed)) break;
-                        live::kv::RedisFlashSaleWaitingRoom room(redis.get(), campaign.id, flash_sale_waiting_capacity);
-                        std::string ticket;
-                        live::messaging::FlashSaleOrderMessage message;
-                        const auto claim_status = room.claim(lease_owner, std::chrono::seconds(30), &ticket, &message);
-                        if (!claim_status.ok()) {
-                            if (!claim_status.isIncomplete()) std::clog << "waiting-room claim failed: " << claim_status.message() << '\n';
-                            continue;
-                        }
-                        bool allowed = false;
-                        live::traffic::RedisTokenBucket global_limiter(redis.get(), "flashsale:{global}:entry_rate",
-                            flash_sale_rate, flash_sale_burst);
-                        auto gate_status = global_limiter.tryAcquire(&allowed);
-                        if (gate_status.ok() && allowed) {
-                            live::traffic::RedisTokenBucket campaign_limiter(redis.get(),
-                                "flashsale:{" + campaign.id + "}:entry_rate", flash_sale_campaign_rate,
-                                flash_sale_campaign_burst);
-                            gate_status = campaign_limiter.tryAcquire(&allowed);
-                        }
-                        if (!gate_status.ok() || !allowed) {
-                            bool released = false;
-                            (void)room.release(ticket, lease_owner, &released);
-                            if (!gate_status.ok()) std::clog << "waiting-room rate gate failed: " << gate_status.message() << '\n';
-                            continue;
-                        }
-                        live::business::flash_sale::FlashSaleSubmitRequest submit;
-                        submit.promotion_id = message.promotion_id;
-                        submit.sku_id = message.sku_id;
-                        submit.user_id = message.user_id;
-                        submit.idempotency_key = message.idempotency_key;
-                        submit.quantity = message.quantity;
-                        live::business::flash_sale::FlashSaleSubmitResult result;
-                        const auto submit_status = flash_order_service->submit(submit, &result);
-                        if (!submit_status.ok()) {
-                            live::business::flash_sale::FlashSaleRequestStatus request_status;
-                            const bool permanent_error = submit_status.code() == live::common::ErrorCode::kInvalidArgument ||
-                                submit_status.code() == live::common::ErrorCode::kNotFound ||
-                                submit_status.code() == live::common::ErrorCode::kFailedPrecondition;
-                            const auto request_lookup = flash_request_status_store->get(ticket, &request_status);
-                            if (permanent_error && request_lookup.ok() &&
-                                request_status.state == live::business::flash_sale::FlashSaleRequestState::kWaiting) {
-                                const auto mark_status = flash_request_status_store->put({ticket, message.user_id, "",
-                                    live::business::flash_sale::FlashSaleRequestState::kRejected,
-                                    submit_status.message(), message.promotion_id});
-                                if (mark_status.ok()) {
-                                    bool completed = false;
-                                    if (room.complete(ticket, lease_owner, &completed).ok() && completed) made_progress = true;
-                                } else {
-                                    bool released = false;
-                                    (void)room.release(ticket, lease_owner, &released);
-                                }
-                            } else if (request_lookup.ok() &&
-                                       request_status.state != live::business::flash_sale::FlashSaleRequestState::kWaiting) {
-                                bool completed = false;
-                                if (room.complete(ticket, lease_owner, &completed).ok() && completed) made_progress = true;
-                            } else {
-                                bool released = false;
-                                (void)room.release(ticket, lease_owner, &released);
-                            }
-                            continue;
-                        }
-                        bool wait = result.code == live::business::flash_sale::SubmitCode::kNotStarted;
-                        if (result.code == live::business::flash_sale::SubmitCode::kRejected) {
-                            live::business::promotion::Promotion current_campaign;
-                            if (promotions.get(message.promotion_id, &current_campaign).ok() &&
-                                (current_campaign.state == live::business::promotion::PromotionState::kCreated ||
-                                 current_campaign.state == live::business::promotion::PromotionState::kPreheating ||
-                                 current_campaign.state == live::business::promotion::PromotionState::kPaused)) wait = true;
-                        }
-                        if (wait) {
-                            bool released = false;
-                            (void)room.release(ticket, lease_owner, &released);
-                            continue;
-                        }
-                        if (result.code == live::business::flash_sale::SubmitCode::kDuplicate) {
-                            live::business::flash_sale::FlashSaleRequestStatus current_status;
-                            const auto status_lookup = flash_request_status_store->get(ticket, &current_status);
-                            if (status_lookup.ok() && current_status.state == live::business::flash_sale::FlashSaleRequestState::kWaiting) {
-                                const auto mark_status = flash_request_status_store->put({ticket, message.user_id, result.order_id,
-                                    live::business::flash_sale::FlashSaleRequestState::kRejected,
-                                    result.message.empty() ? "user was already admitted to this campaign" : result.message,
-                                    message.promotion_id});
-                                if (!mark_status.ok()) {
-                                    bool released = false;
-                                    (void)room.release(ticket, lease_owner, &released);
-                                    continue;
-                                }
-                            }
-                        } else if (result.code != live::business::flash_sale::SubmitCode::kQueued) {
-                            const auto state = result.code == live::business::flash_sale::SubmitCode::kExhausted
-                                ? live::business::flash_sale::FlashSaleRequestState::kSoldOut
-                                : live::business::flash_sale::FlashSaleRequestState::kRejected;
-                            const auto mark_status = flash_request_status_store->put({ticket, message.user_id, result.order_id, state,
-                                result.message, message.promotion_id});
-                            if (!mark_status.ok()) {
-                                bool released = false;
-                                (void)room.release(ticket, lease_owner, &released);
-                                continue;
-                            }
-                        }
-                        bool completed = false;
-                        const auto complete_status = room.complete(ticket, lease_owner, &completed);
-                        if (!complete_status.ok()) std::clog << "waiting-room completion failed: " << complete_status.message() << '\n';
-                        if (complete_status.ok() && completed) made_progress = true;
-                    }
-                    if (!made_progress) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
-            });
-        }
-    }
-#endif
-
     std::atomic<bool> expiry_worker_stop{false};
     std::thread expiry_worker;
 #ifdef ECOMMERCE_HAS_MYSQL
-    if (run_background_workers && mysql_store != nullptr) {
+    if (run_reconciler && mysql_store != nullptr) {
         const auto expiry_worker_id = "expiry-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         expiry_worker = std::thread([&, expiry_worker_id] {
             while (!expiry_worker_stop.load(std::memory_order_relaxed)) {
@@ -914,18 +747,21 @@ int main(int argc, char** argv) {
 #endif
 
     auto publishEvent = [&](const live::messaging::Event& event) {
-#ifdef ECOMMERCE_HAS_ROCKETMQ
-        if (rocketmq_publisher != nullptr) return rocketmq_publisher->publish(event);
+        live::common::Status status;
+#ifdef ECOMMERCE_HAS_RABBITMQ
+        if (rabbitmq_publisher != nullptr) status = rabbitmq_publisher->publish(event);
+        else
 #endif
-#ifdef ECOMMERCE_HAS_KAFKA
-        if (kafka != nullptr) return kafka->publish(event);
-#endif
-        return broker.publish(event);
+            status = broker.publish(event);
+        if (process_role == "reconciler" && status.ok()) {
+            live::common::testing::crashOnceAt("after_outbox_confirm_before_mark");
+        }
+        return status;
     };
 #ifdef ECOMMERCE_HAS_MYSQL
     std::atomic<bool> mysql_outbox_stop{false};
     std::thread mysql_outbox_thread;
-    if (run_background_workers && mysql_store != nullptr) {
+    if (run_reconciler && mysql_store != nullptr) {
         mysql_outbox_thread = std::thread([&] {
             while (!mysql_outbox_stop.load(std::memory_order_relaxed)) {
                 (void)mysql_store->drainOutbox(publishEvent);
@@ -935,63 +771,16 @@ int main(int argc, char** argv) {
     }
 #endif
     // Replay records left by a previous process before serving new traffic.
-    if (run_background_workers) {
+    if (run_reconciler) {
         if (const auto replay_status = outbox.drain(publishEvent); !replay_status.ok()) {
             std::cerr << "outbox replay is pending: " << replay_status.message() << '\n';
         }
     }
     live::messaging::AsyncOutboxDispatcher outbox_dispatcher(&outbox, publishEvent);
-    if (run_background_workers && !outbox_dispatcher.start().ok()) {
+    if (run_reconciler && !outbox_dispatcher.start().ok()) {
         std::cerr << "failed to start outbox dispatcher\n";
         return 1;
     }
-#ifdef ECOMMERCE_HAS_KAFKA
-    std::unique_ptr<live::messaging::KafkaConsumer> notification_consumer;
-    std::unique_ptr<live::messaging::KafkaProducer> notification_publisher;
-    std::atomic<bool> notification_worker_stop{false};
-    std::thread notification_worker;
-    if (run_background_workers && kafka_brokers != nullptr && kafka != nullptr) {
-        notification_consumer = std::make_unique<live::messaging::KafkaConsumer>();
-        notification_publisher = std::make_unique<live::messaging::KafkaProducer>();
-        const auto topic = std::getenv("ECOMMERCE_NOTIFICATION_TOPIC") == nullptr
-            ? std::string("notification.events") : std::string(std::getenv("ECOMMERCE_NOTIFICATION_TOPIC"));
-        const char* group = std::getenv("ECOMMERCE_NOTIFICATION_GROUP");
-        const auto consumer_status = notification_consumer->start(kafka_brokers,
-            group == nullptr ? "ecommerce-notification-fanout" : group, {"order.events"});
-        const auto publisher_status = notification_publisher->start(kafka_brokers, "ecommerce-notification-publisher");
-        if (!consumer_status.ok() || !publisher_status.ok()) {
-            std::clog << "notification fanout is disabled: " <<
-                (!consumer_status.ok() ? consumer_status.message() : publisher_status.message()) << '\n';
-            notification_consumer.reset();
-            notification_publisher.reset();
-        } else {
-            notification_worker = std::thread([&] {
-                while (!notification_worker_stop.load(std::memory_order_relaxed)) {
-                    const auto poll_status = notification_consumer->poll(250, [&](const live::messaging::Event& event) {
-                        const std::string prefix = "OrderCreated|";
-                        if (event.payload.rfind(prefix, 0) != 0) return live::common::Status::Ok();
-                        const auto order_end = event.payload.find('|', prefix.size());
-                        if (order_end == std::string::npos) return live::common::Status::Ok();
-                        const auto user_end = event.payload.find('|', order_end + 1);
-                        if (user_end == std::string::npos) return live::common::Status::Ok();
-                        const auto order_id = event.payload.substr(prefix.size(), order_end - prefix.size());
-                        const auto user_id = event.payload.substr(order_end + 1, user_end - order_end - 1);
-                        live::messaging::Event notification;
-                        notification.event_id = "order-confirmation-" + order_id;
-                        notification.topic = topic;
-                        notification.key = order_id;
-                        notification.payload = "OrderConfirmation|" + order_id + "|" + user_id;
-                        return notification_publisher->publish(notification);
-                    });
-                    if (!poll_status.ok()) {
-                        std::clog << "notification fanout poll failed: " << poll_status.message() << '\n';
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    }
-                }
-            });
-        }
-    }
-#endif
 
     const std::size_t http_max_connections = envSize("ECOMMERCE_HTTP_MAX_CONNECTIONS", 10000, 100000);
     const std::size_t http_worker_count = envSize("ECOMMERCE_HTTP_WORKERS", 8, 256);
@@ -1131,19 +920,6 @@ int main(int argc, char** argv) {
         const auto previous_status = flash_ingress_status_store->get(submit.idempotency_key, &previous_request);
         if (previous_status.ok()) {
             if (previous_request.user_id != current.id) return forbiddenResponse("idempotency key belongs to another user");
-            if (previous_request.state == live::business::flash_sale::FlashSaleRequestState::kWaiting) {
-                if (previous_request.promotion_id != campaign_id) return jsonResponse(409, "Conflict", "{\"error\":\"waiting-room ticket belongs to another campaign\"}");
-#ifdef ECOMMERCE_HAS_REDIS
-                std::size_t queue_position = 0;
-                live::kv::RedisFlashSaleWaitingRoom room(redis.get(), campaign_id, flash_sale_waiting_capacity);
-                const auto position_status = room.position(submit.idempotency_key, &queue_position);
-                if (!position_status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"waiting-room status unavailable\"}");
-                return jsonResponse(202, "Accepted", "{\"request_id\":\"" + jsonEscape(submit.idempotency_key) +
-                    "\",\"state\":\"WAITING\",\"queue_position\":" + std::to_string(queue_position) + "}");
-#else
-                return jsonResponse(503, "Service Unavailable", "{\"error\":\"waiting room requires Redis\"}");
-#endif
-            }
             if (previous_request.state != live::business::flash_sale::FlashSaleRequestState::kSubmitting) {
                 return jsonResponse(200, "OK", "{\"request_id\":\"" + jsonEscape(previous_request.request_id) +
                     "\",\"order_id\":\"" + jsonEscape(previous_request.order_id) + "\",\"state\":\"" +
@@ -1151,7 +927,7 @@ int main(int argc, char** argv) {
                     jsonEscape(previous_request.message) + "\"}");
             }
         }
-        if (previous_status.code() != live::common::ErrorCode::kNotFound) {
+        if (!previous_status.ok() && previous_status.code() != live::common::ErrorCode::kNotFound) {
             return jsonResponse(503, "Service Unavailable", "{\"error\":\"request status unavailable\"}");
         }
         bool waiting_needed = false;
@@ -1171,60 +947,7 @@ int main(int argc, char** argv) {
         } else
 #endif
         if (!flash_sale_limiter.tryAcquire()) return jsonResponse(429, "Too Many Requests", "{\"error\":\"rate limited\"}");
-        if (waiting_needed) {
-#ifdef ECOMMERCE_HAS_REDIS
-            if (redis != nullptr && waiting_room_enabled && flash_queue_mode != "local") {
-                bool inserted = false;
-                const live::business::flash_sale::FlashSaleRequestStatus waiting_status{
-                    submit.idempotency_key, submit.user_id, "", live::business::flash_sale::FlashSaleRequestState::kWaiting,
-                    "request is waiting for admission capacity", campaign_id};
-                const auto claim_status = flash_ingress_status_store->putIfAbsent(waiting_status, &inserted);
-                if (!claim_status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"waiting-room status could not be stored\"}");
-                if (!inserted) {
-                    live::business::flash_sale::FlashSaleRequestStatus raced;
-                    if (const auto lookup = flash_ingress_status_store->get(submit.idempotency_key, &raced); !lookup.ok())
-                        return jsonResponse(503, "Service Unavailable", "{\"error\":\"request status unavailable\"}");
-                    if (raced.user_id != current.id) return forbiddenResponse("idempotency key belongs to another user");
-                    if (raced.state == live::business::flash_sale::FlashSaleRequestState::kSubmitting) {
-                        if (raced.promotion_id != campaign_id) return jsonResponse(409, "Conflict", "{\"error\":\"idempotency key belongs to another campaign\"}");
-                        bool transitioned = false;
-                        const auto transition_status = flash_ingress_status_store->transition(submit.idempotency_key,
-                            live::business::flash_sale::FlashSaleRequestState::kSubmitting,
-                            live::business::flash_sale::FlashSaleRequestState::kWaiting, &transitioned);
-                        if (!transition_status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"waiting-room recovery failed\"}");
-                        if (transitioned) {
-                            raced.state = live::business::flash_sale::FlashSaleRequestState::kWaiting;
-                        } else if (const auto lookup = flash_ingress_status_store->get(submit.idempotency_key, &raced); !lookup.ok()) {
-                            return jsonResponse(503, "Service Unavailable", "{\"error\":\"request status unavailable\"}");
-                        }
-                    }
-                    if (raced.state != live::business::flash_sale::FlashSaleRequestState::kWaiting)
-                        return jsonResponse(200, "OK", "{\"request_id\":\"" + jsonEscape(raced.request_id) + "\",\"order_id\":\"" +
-                            jsonEscape(raced.order_id) + "\",\"state\":\"" + live::business::flash_sale::flashSaleRequestStateName(raced.state) + "\"}");
-                    if (raced.promotion_id != campaign_id) return jsonResponse(409, "Conflict", "{\"error\":\"idempotency key belongs to another campaign\"}");
-                }
-                live::messaging::FlashSaleOrderMessage waiting_message;
-                waiting_message.promotion_id = campaign_id;
-                waiting_message.sku_id = submit.sku_id;
-                waiting_message.idempotency_key = submit.idempotency_key;
-                waiting_message.user_id = submit.user_id;
-                waiting_message.quantity = submit.quantity;
-                live::kv::RedisFlashSaleWaitingRoom room(redis.get(), campaign_id, flash_sale_waiting_capacity);
-                std::size_t queue_position = 0;
-                const auto enqueue_status = room.enqueue(waiting_message, &queue_position);
-                if (!enqueue_status.ok()) {
-                    (void)flash_ingress_status_store->put({submit.idempotency_key, submit.user_id, "",
-                        live::business::flash_sale::FlashSaleRequestState::kRejected, enqueue_status.message(), campaign_id});
-                    return jsonResponse(enqueue_status.code() == live::common::ErrorCode::kResourceExhausted ? 429 : 503,
-                        enqueue_status.code() == live::common::ErrorCode::kResourceExhausted ? "Too Many Requests" : "Service Unavailable",
-                        "{\"error\":\"" + jsonEscape(enqueue_status.message()) + "\"}");
-                }
-                return jsonResponse(202, "Accepted", "{\"request_id\":\"" + jsonEscape(submit.idempotency_key) +
-                    "\",\"state\":\"WAITING\",\"queue_position\":" + std::to_string(queue_position) + "}");
-            }
-#endif
-            return jsonResponse(429, "Too Many Requests", "{\"error\":\"admission capacity exceeded\"}");
-        }
+        if (waiting_needed) return jsonResponse(429, "Too Many Requests", "{\"error\":\"admission capacity exceeded\"}");
         live::business::flash_sale::FlashSaleSubmitResult result;
         const auto status = flash_order_service->submit(submit, &result);
         if (!status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
@@ -1245,22 +968,12 @@ int main(int argc, char** argv) {
             status.code() == live::common::ErrorCode::kNotFound ? "Not Found" : "Service Unavailable",
             "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
         if (result.user_id != current.id) return forbiddenResponse("request belongs to another user");
-        std::string queue_position_field;
-#ifdef ECOMMERCE_HAS_REDIS
-        if (result.state == live::business::flash_sale::FlashSaleRequestState::kWaiting) {
-            live::kv::RedisFlashSaleWaitingRoom room(redis.get(), result.promotion_id, flash_sale_waiting_capacity);
-            std::size_t queue_position = 0;
-            const auto position_status = room.position(result.request_id, &queue_position);
-            if (!position_status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"waiting-room status unavailable\"}");
-            queue_position_field = ",\"queue_position\":" + std::to_string(queue_position);
-        }
-#endif
         return jsonResponse(200, "OK", "{\"request_id\":\"" + jsonEscape(result.request_id) + "\",\"order_id\":\"" +
             jsonEscape(result.order_id) + "\",\"state\":\"" + live::business::flash_sale::flashSaleRequestStateName(result.state) +
-            "\",\"message\":\"" + jsonEscape(result.message) + "\"" + queue_position_field + "}");
+            "\",\"message\":\"" + jsonEscape(result.message) + "\"}");
     });
     server.router().addRoute("GET", "/metrics", [&](const auto&) {
-        const bool queue_depth_known = flash_queue_mode != "rocketmq";
+        const bool queue_depth_known = true;
         active_connections_metric.set(static_cast<double>(server.activeConnections()));
         http_worker_queue_metric.set(static_cast<double>(server.pendingWorkerRequests()));
         flash_queue_depth_metric.set(queue_depth_known ? static_cast<double>(flash_order_queue->pending()) : -1.0);
@@ -1271,7 +984,7 @@ int main(int argc, char** argv) {
         return live::gateway::http::HttpResponse{200, "OK", {{"Content-Type", "text/plain; version=0.0.4"}}, metrics.renderPrometheus()};
     });
     server.router().addRoute("GET", "/debug/stats", [&](const auto&) {
-        const bool queue_depth_known = flash_queue_mode != "rocketmq";
+        const bool queue_depth_known = true;
         return jsonResponse(200, "OK", "{\"http_requests\":" + std::to_string(http_requests_metric.value()) +
             ",\"http_active_connections\":" + std::to_string(server.activeConnections()) +
             ",\"http_worker_queue_depth\":" + std::to_string(server.pendingWorkerRequests()) +
@@ -1492,86 +1205,24 @@ int main(int argc, char** argv) {
     server.router().addRoute("GET", "/admin/dlq", [&](const auto& request) {
         const int admin_auth = authorizeAdmin(request, admin_credentials, "admin", nullptr);
         if (admin_auth != 0) return adminAuthResponse(admin_auth);
-#ifdef ECOMMERCE_HAS_REDIS
-        if (flash_queue_mode == "redis") {
-            auto* dead_letters = dynamic_cast<live::kv::RedisOrderQueue*>(flash_dead_letter_queue.get());
-            if (dead_letters == nullptr) return jsonResponse(503, "Service Unavailable", "{\"error\":\"Redis DLQ is not configured\"}");
+#ifdef ECOMMERCE_HAS_RABBITMQ
+        if (flash_queue_mode == "rabbitmq") {
+            auto* dead_letters = dynamic_cast<live::messaging::RabbitMqOrderQueue*>(flash_dead_letter_queue.get());
+            if (dead_letters == nullptr) return jsonResponse(503, "Service Unavailable", "{\"error\":\"RabbitMQ DLQ is not configured\"}");
             std::int64_t limit = 100;
             const auto limit_text = queryValue(request.target, "limit");
             if (!limit_text.empty() && !parseInt64(limit_text, &limit)) return jsonResponse(400, "Bad Request", "{\"error\":\"invalid limit\"}");
             if (limit <= 0) return jsonResponse(400, "Bad Request", "{\"error\":\"limit must be positive\"}");
-            std::vector<std::string> payloads;
-            const auto status = dead_letters->peekRaw(static_cast<std::size_t>(std::min<std::int64_t>(limit, 1000)), &payloads);
+            std::vector<live::messaging::FlashSaleOrderMessage> messages;
+            const auto status = dead_letters->peekDlq(static_cast<std::size_t>(std::min<std::int64_t>(limit, 1000)), &messages);
             if (!status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
-            std::string body = "{\"queue\":\"redis\",\"messages\":[";
-            for (std::size_t i = 0; i < payloads.size(); ++i) {
-                if (i != 0) body += ',';
-                live::messaging::FlashSaleOrderMessage message;
-                if (live::messaging::FlashSaleOrderMessage::deserialize(payloads[i], &message).ok()) {
-                    body += "{\"valid\":true,\"order_id\":\"" + jsonEscape(message.order_id) + "\",\"request_id\":\"" + jsonEscape(message.idempotency_key) +
-                        "\",\"user_id\":\"" + jsonEscape(message.user_id) + "\",\"sku_id\":\"" + jsonEscape(message.sku_id) +
-                        "\",\"quantity\":" + std::to_string(message.quantity) + "}";
-                } else {
-                    body += "{\"valid\":false,\"payload\":\"" + jsonEscape(payloads[i]) + "\"}";
-                }
-            }
-            return jsonResponse(200, "OK", body + "]}");
-        }
-#endif
-#ifdef ECOMMERCE_HAS_KAFKA
-        if (flash_queue_mode != "rocketmq" && kafka_brokers != nullptr && kafka != nullptr) {
-            const std::string topic = std::getenv("ECOMMERCE_FLASH_SALE_TOPIC") == nullptr
-                ? "flash-sale-orders.DLQ" : std::string(std::getenv("ECOMMERCE_FLASH_SALE_TOPIC")) + ".DLQ";
-            std::int64_t limit = 100;
-            const auto limit_text = queryValue(request.target, "limit");
-            if (!limit_text.empty() && !parseInt64(limit_text, &limit)) return jsonResponse(400, "Bad Request", "{\"error\":\"invalid limit\"}");
-            if (limit <= 0) return jsonResponse(400, "Bad Request", "{\"error\":\"limit must be positive\"}");
-            std::vector<live::messaging::Event> events;
-            const auto status = live::messaging::KafkaDlqOperator::peek(kafka_brokers, topic,
-                static_cast<std::size_t>(std::min<std::int64_t>(limit, 1000)), &events);
-            if (!status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
-            std::string body = "{\"queue\":\"kafka\",\"topic\":\"" + jsonEscape(topic) + "\",\"messages\":[";
-            for (std::size_t i = 0; i < events.size(); ++i) {
-                if (i != 0) body += ',';
-                live::messaging::FlashSaleOrderMessage message;
-                if (live::messaging::FlashSaleOrderMessage::deserialize(events[i].payload, &message).ok()) {
-                    body += "{\"valid\":true,\"event_id\":\"" + jsonEscape(events[i].event_id) + "\",\"order_id\":\"" +
-                        jsonEscape(message.order_id) + "\",\"request_id\":\"" + jsonEscape(message.idempotency_key) +
-                        "\",\"user_id\":\"" + jsonEscape(message.user_id) + "\",\"sku_id\":\"" +
-                        jsonEscape(message.sku_id) + "\",\"quantity\":" + std::to_string(message.quantity) + "}";
-                } else {
-                    body += "{\"valid\":false,\"event_id\":\"" + jsonEscape(events[i].event_id) + "\",\"payload\":\"" +
-                        jsonEscape(events[i].payload) + "\"}";
-                }
-            }
-            return jsonResponse(200, "OK", body + "]}");
-        }
-#endif
-#ifdef ECOMMERCE_HAS_ROCKETMQ
-        if (flash_queue_mode == "rocketmq") {
-            auto* rocketmq = dynamic_cast<live::messaging::RocketMqOrderQueue*>(flash_order_queue.get());
-            if (rocketmq == nullptr) return jsonResponse(503, "Service Unavailable", "{\"error\":\"RocketMQ DLQ operations are not configured\"}");
-            std::int64_t limit = 100;
-            const auto limit_text = queryValue(request.target, "limit");
-            if (!limit_text.empty() && !parseInt64(limit_text, &limit)) return jsonResponse(400, "Bad Request", "{\"error\":\"invalid limit\"}");
-            if (limit <= 0) return jsonResponse(400, "Bad Request", "{\"error\":\"limit must be positive\"}");
-            std::vector<live::messaging::RocketMqDlqMessage> messages;
-            const auto status = rocketmq->peekDlq(static_cast<std::size_t>(std::min<std::int64_t>(limit, 1000)), &messages);
-            if (!status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
-            std::string body = "{\"queue\":\"rocketmq\",\"messages\":[";
+            std::string body = "{\"queue\":\"rabbitmq\",\"messages\":[";
             for (std::size_t i = 0; i < messages.size(); ++i) {
                 if (i != 0) body += ',';
-                live::messaging::FlashSaleOrderMessage command;
-                if (live::messaging::FlashSaleOrderMessage::deserialize(messages[i].payload, &command).ok()) {
-                    body += "{\"valid\":true,\"message_id\":\"" + jsonEscape(messages[i].message_id) +
-                        "\",\"order_id\":\"" + jsonEscape(command.order_id) + "\",\"request_id\":\"" +
-                        jsonEscape(command.idempotency_key) + "\",\"user_id\":\"" + jsonEscape(command.user_id) +
-                        "\",\"sku_id\":\"" + jsonEscape(command.sku_id) + "\",\"quantity\":" +
-                        std::to_string(command.quantity) + "}";
-                } else {
-                    body += "{\"valid\":false,\"message_id\":\"" + jsonEscape(messages[i].message_id) +
-                        "\",\"payload_size\":" + std::to_string(messages[i].payload.size()) + "}";
-                }
+                const auto& message = messages[i];
+                body += "{\"valid\":true,\"order_id\":\"" + jsonEscape(message.order_id) + "\",\"request_id\":\"" +
+                    jsonEscape(message.idempotency_key) + "\",\"user_id\":\"" + jsonEscape(message.user_id) +
+                    "\",\"sku_id\":\"" + jsonEscape(message.sku_id) + "\",\"quantity\":" + std::to_string(message.quantity) + "}";
             }
             return jsonResponse(200, "OK", body + "]}");
         }
@@ -1581,57 +1232,23 @@ int main(int argc, char** argv) {
     server.router().addRoute("POST", "/admin/dlq/replay", [&](const auto& request) {
         const int admin_auth = authorizeAdmin(request, admin_credentials, "admin", nullptr);
         if (admin_auth != 0) return adminAuthResponse(admin_auth);
-#ifdef ECOMMERCE_HAS_REDIS
-        if (flash_queue_mode == "redis") {
-            auto* dead_letters = dynamic_cast<live::kv::RedisOrderQueue*>(flash_dead_letter_queue.get());
-            auto* target_queue = dynamic_cast<live::kv::RedisOrderQueue*>(flash_order_queue.get());
-            if (dead_letters == nullptr || target_queue == nullptr) return jsonResponse(503, "Service Unavailable", "{\"error\":\"Redis DLQ replay is not configured\"}");
+#ifdef ECOMMERCE_HAS_RABBITMQ
+        if (flash_queue_mode == "rabbitmq") {
+            auto* dead_letters = dynamic_cast<live::messaging::RabbitMqOrderQueue*>(flash_dead_letter_queue.get());
+            auto* target_queue = dynamic_cast<live::messaging::RabbitMqOrderQueue*>(flash_order_queue.get());
+            if (dead_letters == nullptr || target_queue == nullptr) return jsonResponse(503, "Service Unavailable", "{\"error\":\"RabbitMQ DLQ replay is not configured\"}");
             std::int64_t max_messages = 10;
             const auto max_text = formValue(request.body, "max_messages");
             if (!max_text.empty() && !parseInt64(max_text, &max_messages)) return jsonResponse(400, "Bad Request", "{\"error\":\"invalid max_messages\"}");
             std::size_t replayed = 0;
-            const auto status = dead_letters->replayTo(target_queue,
+            const auto status = dead_letters->replayDlq(target_queue,
                 static_cast<std::size_t>(std::max<std::int64_t>(1, std::min<std::int64_t>(max_messages, 1000))), &replayed);
-            metrics.increment("redis_dlq_replayed_total", replayed);
-            if (!status.ok()) return jsonResponse(409, "Conflict", "{\"replayed\":" + std::to_string(replayed) + ",\"error\":\"" + jsonEscape(status.message()) + "\"}");
+            metrics.increment("rabbitmq_dlq_replayed_total", replayed);
+            if (!status.ok()) return jsonResponse(503, "Service Unavailable", "{\"replayed\":" + std::to_string(replayed) + ",\"error\":\"" + jsonEscape(status.message()) + "\"}");
             return jsonResponse(200, "OK", "{\"replayed\":" + std::to_string(replayed) + "}");
         }
 #endif
-#ifdef ECOMMERCE_HAS_ROCKETMQ
-        if (flash_queue_mode == "rocketmq") {
-            auto* rocketmq = dynamic_cast<live::messaging::RocketMqOrderQueue*>(flash_order_queue.get());
-            if (rocketmq == nullptr) return jsonResponse(503, "Service Unavailable", "{\"error\":\"RocketMQ DLQ operations are not configured\"}");
-            std::int64_t max_messages = 10;
-            const auto max_text = formValue(request.body, "max_messages");
-            if (!max_text.empty() && !parseInt64(max_text, &max_messages)) return jsonResponse(400, "Bad Request", "{\"error\":\"invalid max_messages\"}");
-            std::size_t replayed = 0;
-            const auto status = rocketmq->replayDlq(static_cast<std::size_t>(std::max<std::int64_t>(1, std::min<std::int64_t>(max_messages, 1000))), &replayed);
-            metrics.increment("rocketmq_dlq_replayed_total", replayed);
-            if (!status.ok()) return jsonResponse(503, "Service Unavailable", "{\"replayed\":" + std::to_string(replayed) +
-                ",\"error\":\"" + jsonEscape(status.message()) + "\"}");
-            return jsonResponse(200, "OK", "{\"replayed\":" + std::to_string(replayed) + "}");
-        }
-#endif
-#ifdef ECOMMERCE_HAS_KAFKA
-        if (kafka_brokers == nullptr || kafka == nullptr) return jsonResponse(503, "Service Unavailable", "{\"error\":\"Kafka is not configured\"}");
-        const std::string dlq_topic = formValue(request.body, "topic").empty()
-            ? (std::getenv("ECOMMERCE_FLASH_SALE_TOPIC") == nullptr ? "flash-sale-orders.DLQ" : std::string(std::getenv("ECOMMERCE_FLASH_SALE_TOPIC")) + ".DLQ")
-            : formValue(request.body, "topic");
-        const std::string target_topic = formValue(request.body, "target_topic").empty()
-            ? (std::getenv("ECOMMERCE_FLASH_SALE_TOPIC") == nullptr ? "flash-sale-orders" : std::getenv("ECOMMERCE_FLASH_SALE_TOPIC"))
-            : formValue(request.body, "target_topic");
-        std::int64_t max_messages = 10;
-        const auto max_text = formValue(request.body, "max_messages");
-        if (!max_text.empty() && !parseInt64(max_text, &max_messages)) return jsonResponse(400, "Bad Request", "{\"error\":\"invalid max_messages\"}");
-        std::size_t replayed = 0;
-        const auto status = live::messaging::KafkaDlqOperator::replay(kafka_brokers, dlq_topic, target_topic,
-                                                                        static_cast<std::size_t>(std::max<std::int64_t>(1, std::min<std::int64_t>(max_messages, 1000))), &replayed);
-        if (!status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
-        metrics.increment("kafka_dlq_replayed_total", replayed);
-        return jsonResponse(200, "OK", "{\"replayed\":" + std::to_string(replayed) + "}");
-#else
-        return jsonResponse(503, "Service Unavailable", "{\"error\":\"Kafka support is not compiled\"}");
-#endif
+        return jsonResponse(503, "Service Unavailable", "{\"error\":\"DLQ replay is not available for the configured transport\"}");
     });
     server.router().addRoute("GET", "/orders", [&](const auto& request) {
         live::business::user::User current;
@@ -1662,45 +1279,6 @@ int main(int argc, char** argv) {
         const auto stock_status = flash_inventory_gateway->confirm(order.sku_id, order.id, &result);
         if (!stock_status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"payment recorded; inventory confirmation pending\"}");
         return jsonResponse(200, "OK", "{\"order_id\":\"" + jsonEscape(order.id) + "\",\"state\":\"PAID\",\"payment\":\"MOCK_SUCCEEDED\"}");
-    });
-    server.router().addRoute("POST", "/payments/callback/mock", [&](const auto& request) {
-#ifndef ECOMMERCE_HAS_MYSQL
-        return jsonResponse(503, "Service Unavailable", "{\"error\":\"durable payment callbacks require MySQL\"}");
-#else
-        if (mysql_store == nullptr) return jsonResponse(503, "Service Unavailable", "{\"error\":\"durable payment callbacks require MySQL\"}");
-        const char* secret_value = std::getenv("ECOMMERCE_PAYMENT_CALLBACK_SECRET");
-        if (secret_value == nullptr || *secret_value == '\0') return jsonResponse(503, "Service Unavailable", "{\"error\":\"payment callback secret is not configured\"}");
-        const auto timestamp_header = request.headers.find("x-payment-timestamp");
-        const auto signature_header = request.headers.find("x-payment-signature");
-        std::int64_t timestamp = 0;
-        if (timestamp_header == request.headers.end() || signature_header == request.headers.end() ||
-            !parseInt64(timestamp_header->second, &timestamp)) return jsonResponse(401, "Unauthorized", "{\"error\":\"invalid payment signature headers\"}");
-        const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-        if (timestamp < now - 300 || timestamp > now + 300 ||
-            !live::common::security::verifyTimestampedHmacSha256(secret_value, timestamp_header->second,
-                                                                  request.body, signature_header->second))
-            return jsonResponse(401, "Unauthorized", "{\"error\":\"invalid or expired payment callback signature\"}");
-        const auto order_id = formValue(request.body, "order_id");
-        const auto transaction_id = formValue(request.body, "transaction_id");
-        std::int64_t amount_cents = -1;
-        if (order_id.empty() || transaction_id.empty() || transaction_id.size() > 128 ||
-            !parseInt64(formValue(request.body, "amount_cents"), &amount_cents) || amount_cents < 0)
-            return jsonResponse(400, "Bad Request", "{\"error\":\"invalid callback payload\"}");
-        live::business::order::Order paid;
-        const auto status = orders.confirmPayment(order_id, "mock", transaction_id, amount_cents, &paid);
-        if (!status.ok()) {
-            const auto code = status.code() == live::common::ErrorCode::kNotFound ? 404 : 409;
-            return jsonResponse(code, code == 404 ? "Not Found" : "Conflict", "{\"error\":\"" + jsonEscape(status.message()) + "\"}");
-        }
-        const auto request_status_update = flash_request_status_store->put({paid.idempotency_key, paid.user_id, paid.id,
-            live::business::flash_sale::FlashSaleRequestState::kPaid, "payment callback confirmed"});
-        if (!request_status_update.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"payment committed; request status cache update pending\"}");
-        live::business::inventory::InventoryReservationResult result;
-        const auto stock_status = flash_inventory_gateway->confirm(paid.sku_id, paid.id, &result);
-        if (!stock_status.ok()) return jsonResponse(503, "Service Unavailable", "{\"error\":\"payment committed; inventory projection will reconcile\"}");
-        return jsonResponse(200, "OK", "{\"order_id\":\"" + jsonEscape(paid.id) + "\",\"state\":\"PAID\"}");
-#endif
     });
     server.router().addRoute("POST", "/orders/cancel", [&](const auto& request) {
         live::business::user::User current;
@@ -1743,16 +1321,8 @@ int main(int argc, char** argv) {
             std::to_string(promotion.starts_at) + ",\"ends_at\":" + std::to_string(promotion.ends_at) + "}");
     });
     const auto stopBackgroundWorkers = [&] {
-        waiting_room_stop.store(true, std::memory_order_relaxed);
-        for (auto& worker : waiting_room_workers) if (worker.joinable()) worker.join();
         campaign_refresh_stop.store(true, std::memory_order_relaxed);
         if (campaign_refresh_thread.joinable()) campaign_refresh_thread.join();
-#ifdef ECOMMERCE_HAS_KAFKA
-        notification_worker_stop.store(true, std::memory_order_relaxed);
-        if (notification_worker.joinable()) notification_worker.join();
-        if (notification_consumer != nullptr) notification_consumer->stop();
-        if (notification_publisher != nullptr) notification_publisher->stop();
-#endif
         if (flash_consumer != nullptr) flash_consumer->stop();
         expiry_worker_stop.store(true, std::memory_order_relaxed);
         if (expiry_worker.joinable()) expiry_worker.join();
@@ -1763,7 +1333,7 @@ int main(int argc, char** argv) {
 #endif
     };
 #ifdef ECOMMERCE_HAS_MYSQL
-    if (run_background_workers && mysql_store != nullptr) {
+    if (run_reconciler && mysql_store != nullptr) {
         campaign_refresh_thread = std::thread([&] {
             while (!campaign_refresh_stop.load(std::memory_order_relaxed)) {
                 const auto refresh_status = promotions.restore();

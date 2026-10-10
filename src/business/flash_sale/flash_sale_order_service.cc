@@ -46,16 +46,13 @@ common::Status FlashSaleOrderService::submit(const FlashSaleSubmitRequest& reque
         return common::Status::FailedPrecondition("flash-sale order path is not configured");
     }
 
-    bool waiting_room_claim = false;
     bool submission_claim = false;
     if (request_status_ != nullptr) {
         FlashSaleRequestStatus existing;
         const auto lookup = request_status_->get(request.idempotency_key, &existing);
         if (lookup.ok()) {
             if (existing.user_id != request.user_id) return common::Status::FailedPrecondition("idempotency key belongs to another user");
-            if (existing.state == FlashSaleRequestState::kWaiting) {
-                waiting_room_claim = true;
-            } else if (existing.state == FlashSaleRequestState::kSubmitting) {
+            if (existing.state == FlashSaleRequestState::kSubmitting) {
                 submission_claim = true;
             } else {
                 result->code = SubmitCode::kDuplicate;
@@ -88,7 +85,7 @@ common::Status FlashSaleOrderService::submit(const FlashSaleSubmitRequest& reque
         }
     }
 
-    if (request_status_ != nullptr && !waiting_room_claim && !submission_claim) {
+    if (request_status_ != nullptr && !submission_claim) {
         bool inserted = false;
         const auto status = request_status_->putIfAbsent({request.idempotency_key, request.user_id, orderId(request),
             FlashSaleRequestState::kSubmitting, "request submission is in progress", request.promotion_id}, &inserted);
@@ -99,8 +96,7 @@ common::Status FlashSaleOrderService::submit(const FlashSaleSubmitRequest& reque
             FlashSaleRequestStatus existing;
             if (const auto lookup = request_status_->get(request.idempotency_key, &existing); !lookup.ok()) return lookup;
             if (existing.user_id != request.user_id) return common::Status::FailedPrecondition("idempotency key belongs to another user");
-            if (existing.state == FlashSaleRequestState::kWaiting) waiting_room_claim = true;
-            else if (existing.state == FlashSaleRequestState::kSubmitting) submission_claim = true;
+            if (existing.state == FlashSaleRequestState::kSubmitting) submission_claim = true;
             else {
                 result->code = SubmitCode::kDuplicate;
                 result->order_id = existing.order_id;
@@ -121,7 +117,7 @@ common::Status FlashSaleOrderService::submit(const FlashSaleSubmitRequest& reque
     result->request_id = request.idempotency_key;
     const bool admission_owned_here = admission.code == ::live::business::promotion::AdmissionCode::kAccepted;
     if (admission.code == ::live::business::promotion::AdmissionCode::kDuplicate &&
-        !submission_claim && !waiting_room_claim) {
+        !submission_claim) {
         result->message = "user already admitted";
         if (request_status_ != nullptr) {
             bool updated = false;
@@ -162,8 +158,7 @@ common::Status FlashSaleOrderService::submit(const FlashSaleSubmitRequest& reque
     }
     if (request_status_ != nullptr) {
         bool updated = false;
-        const auto expected_state = waiting_room_claim ? FlashSaleRequestState::kWaiting : FlashSaleRequestState::kSubmitting;
-        const auto status = request_status_->transition(request.idempotency_key, expected_state,
+        const auto status = request_status_->transition(request.idempotency_key, FlashSaleRequestState::kSubmitting,
             FlashSaleRequestState::kQueued, &updated);
         if (!status.ok()) {
             // The request claim remains recoverable. A retry can safely send
